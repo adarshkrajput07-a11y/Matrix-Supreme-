@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 import yt_dlp
 from pyrogram import enums, filters
-from pyrogram.errors import FloodWait, MessageNotModified, UserNotParticipant
+from pyrogram.errors import FloodWait, MessageNotModified, InviteRequestSent, UserAlreadyParticipant, UserNotParticipant
 from pyrogram.types import InlineKeyboardButton as B
 from pyrogram.types import InlineKeyboardMarkup as M
 from pytgcalls import filters as fl
@@ -145,12 +145,78 @@ def related(title: str, history: set) -> str | None:
 
 
 async def ensure_assistant(chat_id: int):
+    """Make sure the assistant account is in the group AND knows the chat (fixes PEER_ID_INVALID)."""
     me = await _assistant.get_me()
+    S_ = enums.ChatMemberStatus
+    present = True
     try:
-        await _bot.get_chat_member(chat_id, me.id)
+        member = await _bot.get_chat_member(chat_id, me.id)
+        if member.status == S_.BANNED:
+            await _bot.unban_chat_member(chat_id, me.id)  # banned/kicked earlier: let it back in
+            present = False
+        elif member.status == S_.LEFT or (member.status == S_.RESTRICTED and not member.is_member):
+            present = False
     except UserNotParticipant:
-        link = await _bot.export_chat_invite_link(chat_id)
-        await _assistant.join_chat(link)
+        present = False
+
+    if not present:
+        # The bot adds the assistant itself through an invite link
+        try:
+            link = await _bot.export_chat_invite_link(chat_id)
+        except Exception:
+            raise RuntimeError(
+                "The assistant isn't in this group and I can't add it. "
+                "Make me an admin with the 'Invite Users via Link' right."
+            )
+        try:
+            await _assistant.join_chat(link)
+        except UserAlreadyParticipant:
+            pass
+        except InviteRequestSent:  # group uses join approval: approve it automatically
+            try:
+                await _bot.approve_chat_join_request(chat_id, me.id)
+            except Exception:
+                raise RuntimeError(
+                    "The assistant requested to join. Approve its join request, then use /play again."
+                )
+        await asyncio.sleep(1)
+
+    async def known() -> bool:
+        try:
+            await _assistant.get_chat(chat_id)
+            return True
+        except Exception:
+            return False
+
+    if await known():
+        return
+    # 1) refresh the assistant's dialog list so it caches the chat
+    try:
+        async for _ in _assistant.get_dialogs():
+            pass
+    except Exception:
+        pass
+    if await known():
+        return
+    # 2) public groups: resolve by username
+    chat = await _bot.get_chat(chat_id)
+    if chat.username:
+        try:
+            await _assistant.get_chat(chat.username)
+        except Exception:
+            pass
+        if await known():
+            return
+    # 3) last resort: join through an invite link
+    try:
+        await _assistant.join_chat(await _bot.export_chat_invite_link(chat_id))
+    except UserAlreadyParticipant:
+        pass
+    if not await known():
+        raise RuntimeError(
+            "The assistant account can't see this group. Send any message from the assistant "
+            "account in the group once, then try /play again."
+        )
 
 
 # ───────────────────────── Card ─────────────────────────
