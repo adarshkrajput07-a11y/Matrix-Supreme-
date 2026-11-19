@@ -81,7 +81,8 @@ HELP = (
     "/addtag <group_id>\n@username - tag\n@username2 - tag2\n\n"
     "Settings (admins):\n"
     "/settings — toggle panel\n"
-    "/setrules <text>, /setwelcome <text>, /setgoodbye <text> ({name})\n"
+    "/setrules <text>, /setwelcome <text>, /setgoodbye <text>\n"
+    "   placeholders: {name} {username} {group}\n"
     "/welcome on|off, /goodbye on|off\n"
     "/lockforward, /unlockforward\n"
     "/links on|off, /flood on|off\n"
@@ -294,20 +295,30 @@ async def setwelcome(update: Update, ctx):
         return
     text = update.message.text.partition(" ")[2].strip()
     if not text:
-        return await update.message.reply_text("Usage: /setwelcome Welcome {name}! Read /rules.")
+        return await update.message.reply_text("Usage: /setwelcome Welcome {name} ({username}) to {group}! Read /rules.\n"
+            "Placeholders: {name} = member's name, {username} = their @username, {group} = group name")
     put(update.effective_chat.id, "welcome", text)
     await update.message.reply_text("✅ Welcome message updated.")
+
+
+def render(template: str, user, chat) -> str:
+    """Fill {name}, {username}, {group} in welcome/goodbye templates."""
+    uname = f"@{user.username}" if user.username else html.escape(user.full_name)
+    return (html.escape(template)
+            .replace("{name}", user.mention_html())
+            .replace("{username}", uname)
+            .replace("{group}", html.escape(chat.title or "the group")))
 
 
 async def welcome(update: Update, ctx):
     cid = update.effective_chat.id
     if not get(cid, "welcome_on"):
         return
-    template = html.escape(get(cid, "welcome") or "Welcome {name} to the group! 👋 Please read /rules.")
+    template = get(cid, "welcome") or "Welcome {name} to {group}! 👋 Please read /rules."
     for u in update.message.new_chat_members:
         if u.is_bot or q("SELECT 1 FROM fbans WHERE user_id=?", u.id).fetchone():
             continue
-        await ctx.bot.send_message(cid, template.replace("{name}", u.mention_html()), parse_mode="HTML")
+        await ctx.bot.send_message(cid, render(template, u, update.effective_chat), parse_mode="HTML")
 
 
 async def goodbye(update: Update, ctx):
@@ -315,8 +326,8 @@ async def goodbye(update: Update, ctx):
     u = update.message.left_chat_member
     if not u or u.is_bot or not get(cid, "goodbye_on"):
         return
-    template = html.escape(get(cid, "goodbye") or "Goodbye {name} 👋")
-    await ctx.bot.send_message(cid, template.replace("{name}", u.mention_html()), parse_mode="HTML")
+    template = get(cid, "goodbye") or "Goodbye {name} 👋"
+    await ctx.bot.send_message(cid, render(template, u, update.effective_chat), parse_mode="HTML")
 
 
 async def setgoodbye(update: Update, ctx):
@@ -324,7 +335,8 @@ async def setgoodbye(update: Update, ctx):
         return
     text = update.message.text.partition(" ")[2].strip()
     if not text:
-        return await update.message.reply_text("Usage: /setgoodbye Goodbye {name}, we'll miss you!")
+        return await update.message.reply_text("Usage: /setgoodbye Goodbye {name}, we'll miss you in {group}!\n"
+            "Placeholders: {name} = member's name, {username} = their @username, {group} = group name")
     put(update.effective_chat.id, "goodbye", text)
     await update.message.reply_text("✅ Goodbye message updated. Turn it on with /goodbye on")
 
