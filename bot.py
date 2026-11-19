@@ -411,4 +411,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Use the SAME event loop the Pyrogram/PyTgCalls clients captured when they were created
+    # (asyncio.run() would make a new one -> "Future attached to a different loop").
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
