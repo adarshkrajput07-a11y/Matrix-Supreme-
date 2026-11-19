@@ -3,10 +3,12 @@ import asyncio
 import base64
 import html
 import os
+import re
 import random
 import time
 from dataclasses import dataclass, field
 
+import httpx
 import yt_dlp
 from pyrogram import enums, filters
 from pyrogram.errors import FloodWait, MessageNotModified, InviteRequestSent, UserAlreadyParticipant, UserBannedInChannel, UserNotParticipant
@@ -16,6 +18,18 @@ from pytgcalls import filters as fl
 from pytgcalls.types import AudioQuality, MediaStream, VideoQuality
 
 HTML = enums.ParseMode.HTML
+def _fix_cookies(text: str) -> str:
+    """Repair cookies pasted from a phone: tabs may have turned into spaces."""
+    out = ["# Netscape HTTP Cookie File"]
+    for line in text.replace("\r", "").splitlines():
+        line = line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        parts = re.split(r"\s+", line, maxsplit=6)
+        out.append("\t".join(parts) if len(parts) == 7 else line)
+    return "\n".join(out) + "\n"
+
+
 def _cookie_file():
     """Optional YouTube cookies (Railway variable YT_COOKIES or YT_COOKIES_B64)."""
     data = None
@@ -27,7 +41,7 @@ def _cookie_file():
         return None
     path = "/tmp/yt_cookies.txt"
     with open(path, "w") as f:
-        f.write(data)
+        f.write(_fix_cookies(data))
     return path
 
 
@@ -113,10 +127,34 @@ def extract(query: str, video: bool = False) -> dict:
     except Exception as first_error:
         if video or query.startswith("http"):
             raise
-        try:
-            return _extract(f"scsearch1:{query}", False)
-        except Exception:
-            raise first_error
+        for fallback in (lambda: _extract(f"scsearch1:{query}", False), lambda: _saavn(query)):
+            try:
+                return fallback()
+            except Exception:
+                continue
+        raise first_error
+
+
+def _saavn(query: str) -> dict:
+    """Optional JioSaavn fallback (great for Hindi songs). Needs env SAAVN_API = base URL of a
+    JioSaavn API instance (saavn.dev-style: GET /api/search/songs?query=...)."""
+    base = os.getenv("SAAVN_API", "").rstrip("/")
+    if not base:
+        raise RuntimeError("SAAVN_API not set")
+    r = httpx.get(f"{base}/api/search/songs", params={"query": query, "limit": 1}, timeout=15)
+    r.raise_for_status()
+    res = r.json()["data"]["results"][0]
+    dl = res["downloadUrl"][-1]["url"]  # highest quality is last
+    img = res.get("image") or []
+    return dict(
+        title=html.unescape(res.get("name", "Unknown")),
+        page_url=res.get("url") or dl,
+        stream_url=dl,
+        thumb=img[-1]["url"] if img else None,
+        duration=int(res.get("duration") or 0),
+        video=False,
+        audio_url=None,
+    )
 
 
 def _extract(query: str, video: bool = False) -> dict:
@@ -562,7 +600,7 @@ def setup(bot, assistant, call, is_admin, q):
                        "@username (Settings → Username), send one message from it in this group, "
                        "then try again.")
             if "Sign in" in err or "not a bot" in err:
-                err = "YouTube is blocking this server (cookies needed)."
+                err = "YouTube is blocking this server. The owner needs to add YouTube cookies (YT_COOKIES)."
             await msg.edit(f"❌ Couldn't play: {err[:250]}\nMake sure a voice chat is started in this group.")
 
     @bot.on_message(filters.command(["play", "p"]) & filters.group)
