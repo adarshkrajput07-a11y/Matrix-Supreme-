@@ -261,6 +261,20 @@ async def tracker(update: Update, ctx):
                     pass
 
 
+async def chat_member_updates(update: Update, ctx):
+    """Record people when they join/change status, even if they never send a message."""
+    cm = update.chat_member
+    if not cm or cm.chat.type not in ("group", "supergroup"):
+        return
+    u = cm.new_chat_member.user
+    if u.is_bot:
+        return
+    if cm.new_chat_member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        return
+    q("INSERT OR REPLACE INTO members VALUES(?,?,?,?)", cm.chat.id, u.id,
+      (u.username or "").lower(), u.full_name)
+
+
 async def my_chat_member(update: Update, ctx):
     ch, new = update.effective_chat, update.my_chat_member.new_chat_member
     if ch.type not in ("group", "supergroup"):
@@ -526,20 +540,29 @@ async def promote(update: Update, ctx):
         target_id, target_name = r.from_user.id, r.from_user.full_name
     elif ctx.args:
         arg = ctx.args[0].lstrip("@")
-        if arg.isdigit():
+        tm = next((e.user for e in (msg.entities or ()) if e.type == "text_mention" and e.user), None)
+        if tm:
+            target_id, target_name = tm.id, tm.full_name
+        elif arg.isdigit():
             target_id = int(arg)
         else:
-            row = q("SELECT user_id, name FROM members WHERE chat_id=? AND username=?",
-                    chat.id, arg.lower()).fetchone()
+            # 1) this group's records, 2) any group the bot is in, 3) Telegram lookup
+            row = (q("SELECT user_id, name FROM members WHERE chat_id=? AND username=?",
+                     chat.id, arg.lower()).fetchone()
+                   or q("SELECT user_id, name FROM members WHERE username=?", arg.lower()).fetchone())
             if row:
                 target_id, target_name = row
             else:
                 try:
                     target_id = (await ctx.bot.get_chat(f"@{arg}")).id
                 except Exception:
-                    return await msg.reply_text(
-                        f"❌ I haven't seen @{arg} yet. Ask them to send a message in the group, "
-                        "or reply to their message with /promote.")
+                    try:
+                        res = await tg_raw("getChat", chat_id=f"@{arg}")
+                        target_id = res["id"]
+                    except Exception:
+                        return await msg.reply_text(
+                            f"❌ Telegram doesn't let bots look up @{arg} unless the bot has seen them. "
+                            "Reply to any of their messages with /promote, or use /promote <user_id>.")
     else:
         return await msg.reply_text("Reply to a user with /promote, or use /promote @username")
 
@@ -978,6 +1001,7 @@ def main():
         app.add_handler(CommandHandler(name, fn))
     groups = filters.ChatType.GROUPS
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(chat_member_updates, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye))
     app.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^set:"))
