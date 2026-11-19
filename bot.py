@@ -24,7 +24,20 @@ assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string
 call = PyTgCalls(assistant)
 
 # ───────────────────────── Database ─────────────────────────
-db = sqlite3.connect(os.getenv("DB_PATH", "bot.db"), check_same_thread=False)
+def open_db():
+    path = os.getenv("DB_PATH", "bot.db")
+    try:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        return sqlite3.connect(path, check_same_thread=False)
+    except (OSError, sqlite3.Error) as e:
+        print(f"WARNING: can't use DB_PATH={path} ({e}). Falling back to local bot.db; "
+              "data will be lost on redeploy. Mount a Railway Volume to fix this.")
+        return sqlite3.connect("bot.db", check_same_thread=False)
+
+
+db = open_db()
 db.executescript(
     """
 CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, kind TEXT);
