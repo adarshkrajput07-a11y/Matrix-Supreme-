@@ -71,7 +71,8 @@ HELP = (
     "/mute [minutes], /unmute\n"
     "/kick, /ban, /unban <user_id>\n"
     "/del, /pin, /unpin\n"
-    "/tagall [message]\n\n"
+    "/tagall [message]\n"
+    "/promote (reply) or /promote @username — make someone an admin\n\n"
     "Locks (admins):\n"
     "/lock all — only admins can talk\n"
     "/lock messages stickers gifs photos videos voice audio documents polls forwards "
@@ -487,6 +488,76 @@ async def unpin(update: Update, ctx):
     await ctx.bot.unpin_chat_message(update.effective_chat.id)
 
 
+# ---------- /promote ----------
+async def promote(update: Update, ctx):
+    msg, chat = update.message, update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return await msg.reply_text("Use this command in a group.")
+    if not await admin_only(update, ctx):
+        return
+    # caller must be the owner or an admin with the "add new admins" right
+    anonymous = msg.sender_chat and msg.sender_chat.id == chat.id
+    if not anonymous:
+        try:
+            c = await ctx.bot.get_chat_member(chat.id, update.effective_user.id)
+            allowed = c.status == ChatMemberStatus.OWNER or (
+                c.status == ChatMemberStatus.ADMINISTRATOR and getattr(c, "can_promote_members", False))
+        except Exception:
+            allowed = False
+        if not allowed:
+            return await msg.reply_text("You need the 'Add new admins' permission to use /promote.")
+
+    # find the target: reply, or @username / user_id argument
+    target_id, target_name = None, None
+    r = msg.reply_to_message
+    if r and r.from_user and not (r.sender_chat and r.sender_chat.id == chat.id):
+        target_id, target_name = r.from_user.id, r.from_user.full_name
+    elif ctx.args:
+        arg = ctx.args[0].lstrip("@")
+        if arg.isdigit():
+            target_id = int(arg)
+        else:
+            row = q("SELECT user_id, name FROM members WHERE chat_id=? AND username=?",
+                    chat.id, arg.lower()).fetchone()
+            if row:
+                target_id, target_name = row
+            else:
+                try:
+                    target_id = (await ctx.bot.get_chat(f"@{arg}")).id
+                except Exception:
+                    return await msg.reply_text(
+                        f"❌ I haven't seen @{arg} yet. Ask them to send a message in the group, "
+                        "or reply to their message with /promote.")
+    else:
+        return await msg.reply_text("Reply to a user with /promote, or use /promote @username")
+
+    try:
+        member = await ctx.bot.get_chat_member(chat.id, target_id)
+    except Exception:
+        return await msg.reply_text("❌ I couldn't find that user in this group.")
+    if member.status == ChatMemberStatus.OWNER:
+        return await msg.reply_text("That's the group owner.")
+    if member.status == ChatMemberStatus.ADMINISTRATOR:
+        return await msg.reply_text("They're already an admin.")
+    if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED):
+        return await msg.reply_text("❌ That user isn't in the group.")
+    if member.user.is_bot:
+        return await msg.reply_text("I won't promote bots.")
+    target_name = target_name or member.user.full_name
+
+    try:
+        await ctx.bot.promote_chat_member(
+            chat.id, target_id,
+            can_manage_chat=True, can_delete_messages=True, can_restrict_members=True,
+            can_pin_messages=True, can_invite_users=True, can_manage_video_chats=True,
+            can_change_info=False, can_promote_members=False)
+    except Exception as e:
+        return await msg.reply_text(
+            f"❌ Couldn't promote: {e}\nMake sure I'm an admin with the 'Add new admins' permission.")
+    _admin_cache.pop((chat.id, target_id), None)
+    await msg.reply_text(f"⭐ {html.escape(target_name)} is now an admin.", parse_mode="HTML")
+
+
 # ---------- federation ban (/fban) ----------
 async def fban(update: Update, ctx):
     if update.effective_user.id not in OWNER_IDS:
@@ -889,7 +960,7 @@ def main():
         "tagall": tagall, "lock": lock, "unlock": unlock, "locks": locks_cmd,
         "fban": fban, "unfban": unfban, "kickme": kickme, "addtag": addtag,
         "settings": settings, "welcome": welcome_cmd, "goodbye": goodbye_cmd,
-        "setgoodbye": setgoodbye, "lockforward": lockforward, "unlockforward": unlockforward,
+        "promote": promote, "setgoodbye": setgoodbye, "lockforward": lockforward, "unlockforward": unlockforward,
     }
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, fn))
