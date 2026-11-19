@@ -23,10 +23,10 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import timedelta
 
-from telegram import ChatPermissions, Update
+from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
-from telegram.ext import (Application, ChatMemberHandler, CommandHandler,
-                          MessageHandler, filters)
+from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler,
+                          CommandHandler, MessageHandler, filters)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS members(chat_id INTEGER, user_id INTEGER, username TE
 CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, title TEXT);
 CREATE TABLE IF NOT EXISTS fbans(user_id INTEGER PRIMARY KEY, reason TEXT);
 """)
+for _col, _ddl in [("welcome_on", "INTEGER DEFAULT 1"), ("goodbye_on", "INTEGER DEFAULT 0"),
+                   ("goodbye", "TEXT"), ("clean_service", "INTEGER DEFAULT 0")]:
+    try:
+        db.execute(f"ALTER TABLE settings ADD COLUMN {_col} {_ddl}")
+        db.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
 flood = defaultdict(lambda: deque(maxlen=FLOOD_MSGS))
 _admin_cache = {}
 
@@ -68,12 +75,15 @@ HELP = (
     "Locks (admins):\n"
     "/lock all — only admins can talk\n"
     "/lock messages stickers gifs photos videos voice audio documents polls forwards "
-    "contacts location media links\n"
+    "contacts location media links invites\n"
     "/unlock <same options>, /locks\n\n"
     "Tags (admins):\n"
     "/addtag <group_id>\n@username - tag\n@username2 - tag2\n\n"
     "Settings (admins):\n"
-    "/setrules <text>, /setwelcome <text> ({name})\n"
+    "/settings — toggle panel\n"
+    "/setrules <text>, /setwelcome <text>, /setgoodbye <text> ({name})\n"
+    "/welcome on|off, /goodbye on|off\n"
+    "/lockforward, /unlockforward\n"
     "/links on|off, /flood on|off\n"
     "/addword, /delword, /words\n\n"
     "Bot owners: /fban (reply or user_id [reason]), /unfban <user_id>"
@@ -108,7 +118,20 @@ LOCK_ALIASES = {
     "location": ["location"], "locations": ["location"],
     "media": ["photos", "videos", "gifs", "voice", "audio", "documents"],
     "link": ["links"], "links": ["links"], "url": ["links"], "urls": ["links"],
+    "invite": ["invites"], "invites": ["invites"], "invitelink": ["invites"],
+    "invitelinks": ["invites"],
 }
+INVITE_RE = re.compile(r"(t\.me|telegram\.me|telegram\.dog)/(\+|joinchat/)", re.I)
+
+
+def has_invite(m):
+    texts = [m.text or m.caption or ""]
+    for e in tuple(m.entities or ()) + tuple(m.caption_entities or ()):
+        if e.url:
+            texts.append(e.url)
+    return any(INVITE_RE.search(t) for t in texts)
+
+
 LOCK_CHECKS = {
     "text": lambda m: bool(m.text) and not m.text.startswith("/"),
     "stickers": lambda m: bool(m.sticker),
@@ -122,6 +145,7 @@ LOCK_CHECKS = {
     "forwards": lambda m: bool(m.forward_origin),
     "contacts": lambda m: bool(m.contact),
     "location": lambda m: bool(m.location or m.venue),
+    "invites": has_invite,
 }
 
 
@@ -277,11 +301,50 @@ async def setwelcome(update: Update, ctx):
 
 async def welcome(update: Update, ctx):
     cid = update.effective_chat.id
-    template = get(cid, "welcome") or "Welcome {name} to the group! 👋 Please read /rules."
+    if not get(cid, "welcome_on"):
+        return
+    template = html.escape(get(cid, "welcome") or "Welcome {name} to the group! 👋 Please read /rules.")
     for u in update.message.new_chat_members:
         if u.is_bot or q("SELECT 1 FROM fbans WHERE user_id=?", u.id).fetchone():
             continue
-        await update.message.reply_text(template.replace("{name}", u.mention_html()), parse_mode="HTML")
+        await ctx.bot.send_message(cid, template.replace("{name}", u.mention_html()), parse_mode="HTML")
+
+
+async def goodbye(update: Update, ctx):
+    cid = update.effective_chat.id
+    u = update.message.left_chat_member
+    if not u or u.is_bot or not get(cid, "goodbye_on"):
+        return
+    template = html.escape(get(cid, "goodbye") or "Goodbye {name} 👋")
+    await ctx.bot.send_message(cid, template.replace("{name}", u.mention_html()), parse_mode="HTML")
+
+
+async def setgoodbye(update: Update, ctx):
+    if not await admin_only(update, ctx):
+        return
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        return await update.message.reply_text("Usage: /setgoodbye Goodbye {name}, we'll miss you!")
+    put(update.effective_chat.id, "goodbye", text)
+    await update.message.reply_text("✅ Goodbye message updated. Turn it on with /goodbye on")
+
+
+async def _onoff(update: Update, ctx, col, label):
+    if not await admin_only(update, ctx):
+        return
+    cid = update.effective_chat.id
+    if ctx.args and ctx.args[0].lower() in ("on", "off"):
+        put(cid, col, int(ctx.args[0].lower() == "on"))
+    await update.message.reply_text(
+        f"{label} is {'ON ✅' if get(cid, col) else 'OFF ❌'}. Use /{label.lower()} on|off")
+
+
+async def welcome_cmd(update: Update, ctx):
+    await _onoff(update, ctx, "welcome_on", "Welcome")
+
+
+async def goodbye_cmd(update: Update, ctx):
+    await _onoff(update, ctx, "goodbye_on", "Goodbye")
 
 
 async def kickme(update: Update, ctx):
@@ -510,59 +573,58 @@ def parse_lock_types(args):
     return list(dict.fromkeys(types)), unknown
 
 
-async def lock(update: Update, ctx):
+async def do_lock(update: Update, ctx, args, on: bool):
     if not await admin_only(update, ctx):
         return
     cid = update.effective_chat.id
-    types, unknown = parse_lock_types(ctx.args)
+    cmd = "lock" if on else "unlock"
+    types, unknown = parse_lock_types(args)
     if not types:
         return await update.message.reply_text(
-            "Usage: /lock all  or  /lock messages stickers gifs photos videos voice audio "
-            "documents polls forwards contacts location media links")
+            f"Usage: /{cmd} all  or  /{cmd} messages stickers gifs photos videos voice audio "
+            "documents polls forwards contacts location media links invites")
     locks = get_locks(cid)
     for t in types:
         if t == "all":
-            await ctx.bot.set_chat_permissions(cid, NO_PERMS, use_independent_chat_permissions=True)
-            locks.add("all")
+            await ctx.bot.set_chat_permissions(
+                cid, NO_PERMS if on else FULL_PERMS, use_independent_chat_permissions=True)
+            if on:
+                locks.add("all")
+            else:
+                locks.clear()
         elif t == "links":
-            put(cid, "links_ok", 0)
-            locks.add("links")
-        else:
+            put(cid, "links_ok", 0 if on else 1)
+        elif on:
             locks.add(t)
-    put_locks(cid, locks)
-    msg = "🔒 Locked: " + ", ".join(types) + (". Only admins can send messages now." if "all" in types else ".")
-    if unknown:
-        msg += "\nUnknown: " + ", ".join(unknown)
-    await update.message.reply_text(msg)
-
-
-async def unlock(update: Update, ctx):
-    if not await admin_only(update, ctx):
-        return
-    cid = update.effective_chat.id
-    types, unknown = parse_lock_types(ctx.args)
-    if not types:
-        return await update.message.reply_text("Usage: /unlock all  or  /unlock stickers gifs ...")
-    locks = get_locks(cid)
-    for t in types:
-        if t == "all":
-            await ctx.bot.set_chat_permissions(cid, FULL_PERMS, use_independent_chat_permissions=True)
-            locks.clear()
-        elif t == "links":
-            put(cid, "links_ok", 1)
-            locks.discard("links")
         else:
             locks.discard(t)
     put_locks(cid, locks)
-    msg = "🔓 Unlocked: " + ", ".join(types) + "."
+    msg = ("🔒 Locked: " if on else "🔓 Unlocked: ") + ", ".join(types)
+    msg += ". Only admins can send messages now." if (on and "all" in types) else "."
     if unknown:
         msg += "\nUnknown: " + ", ".join(unknown)
     await update.message.reply_text(msg)
+
+
+async def lock(update: Update, ctx):
+    await do_lock(update, ctx, ctx.args, True)
+
+
+async def unlock(update: Update, ctx):
+    await do_lock(update, ctx, ctx.args, False)
+
+
+async def lockforward(update: Update, ctx):
+    await do_lock(update, ctx, ["forwards"], True)
+
+
+async def unlockforward(update: Update, ctx):
+    await do_lock(update, ctx, ["forwards"], False)
 
 
 async def locks_cmd(update: Update, ctx):
     cid = update.effective_chat.id
-    locks = get_locks(cid)
+    locks = get_locks(cid) - {"links"}
     if not get(cid, "links_ok"):
         locks.add("links")
     await update.message.reply_text("🔒 Active locks: " + (", ".join(sorted(locks)) or "none"))
@@ -682,6 +744,88 @@ async def words(update: Update, ctx):
                                     else "Blacklist is empty.")
 
 
+# ---------- /settings panel ----------
+SETTING_BUTTONS = [
+    ("flood", "Anti-flood"), ("links", "Lock links"),
+    ("invites", "Lock invite links"), ("forwards", "Lock forwards"),
+    ("service", "Clean service msgs"), ("welcome", "Welcome"),
+    ("goodbye", "Goodbye"),
+]
+
+
+def setting_state(cid, key) -> bool:
+    if key == "flood":
+        return bool(get(cid, "flood_on"))
+    if key == "links":
+        return not get(cid, "links_ok")
+    if key in ("invites", "forwards"):
+        return key in get_locks(cid)
+    if key == "service":
+        return bool(get(cid, "clean_service"))
+    if key == "welcome":
+        return bool(get(cid, "welcome_on"))
+    return bool(get(cid, "goodbye_on"))
+
+
+def setting_toggle(cid, key):
+    new = not setting_state(cid, key)
+    if key == "flood":
+        put(cid, "flood_on", int(new))
+    elif key == "links":
+        put(cid, "links_ok", int(not new))
+    elif key in ("invites", "forwards"):
+        locks = get_locks(cid)
+        (locks.add if new else locks.discard)(key)
+        put_locks(cid, locks)
+    elif key == "service":
+        put(cid, "clean_service", int(new))
+    elif key == "welcome":
+        put(cid, "welcome_on", int(new))
+    else:
+        put(cid, "goodbye_on", int(new))
+
+
+def settings_panel(cid):
+    btns = [InlineKeyboardButton(f"{label}: {'✅' if setting_state(cid, key) else '❌'}",
+                                 callback_data=f"set:{key}") for key, label in SETTING_BUTTONS]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton("✖️ Close", callback_data="set:close")])
+    text = ("⚙️ Moderation settings\nTap a button to toggle it. Details: "
+            "/flood /lock /setwelcome /setgoodbye /welcome /goodbye")
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def settings(update: Update, ctx):
+    if not await admin_only(update, ctx):
+        return
+    text, kb = settings_panel(update.effective_chat.id)
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def settings_cb(update: Update, ctx):
+    qy = update.callback_query
+    cid = qy.message.chat_id
+    if not await is_admin(ctx, cid, qy.from_user.id):
+        return await qy.answer("Admins only.", show_alert=True)
+    key = qy.data.split(":", 1)[1]
+    if key == "close":
+        await qy.answer()
+        return await qy.message.delete()
+    if key in dict(SETTING_BUTTONS):
+        setting_toggle(cid, key)
+    await qy.edit_message_reply_markup(reply_markup=settings_panel(cid)[1])
+    await qy.answer("Updated ✅")
+
+
+async def clean_service(update: Update, ctx):
+    msg = update.effective_message
+    if msg and get(msg.chat_id, "clean_service"):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+
 # ---------- automatic filters ----------
 async def link_filter(update: Update, ctx):
     msg = update.message
@@ -732,18 +876,23 @@ def main():
         "addword": addword, "delword": delword, "words": words,
         "tagall": tagall, "lock": lock, "unlock": unlock, "locks": locks_cmd,
         "fban": fban, "unfban": unfban, "kickme": kickme, "addtag": addtag,
+        "settings": settings, "welcome": welcome_cmd, "goodbye": goodbye_cmd,
+        "setgoodbye": setgoodbye, "lockforward": lockforward, "unlockforward": unlockforward,
     }
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, fn))
     groups = filters.ChatType.GROUPS
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye))
+    app.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^set:"))
     app.add_handler(MessageHandler(groups & filters.ALL, tracker), group=-1)
     app.add_handler(MessageHandler(
         groups & (filters.Entity("url") | filters.Entity("text_link")), link_filter), group=1)
     app.add_handler(MessageHandler(groups & ~filters.COMMAND & (filters.TEXT | filters.CAPTION),
                                    text_filter), group=2)
     app.add_handler(MessageHandler(groups & filters.ALL, lock_filter), group=3)
+    app.add_handler(MessageHandler(groups & filters.StatusUpdate.ALL, clean_service), group=4)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
