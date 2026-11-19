@@ -1,0 +1,6 @@
+pyrogram
+tgcrypto
+py-tgcalls
+yt-dlp
+httpx
+python-dotenv
