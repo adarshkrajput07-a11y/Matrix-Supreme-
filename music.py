@@ -13,7 +13,7 @@ from pyrogram.errors import FloodWait, MessageNotModified, InviteRequestSent, Us
 from pyrogram.types import InlineKeyboardButton as B
 from pyrogram.types import InlineKeyboardMarkup as M
 from pytgcalls import filters as fl
-from pytgcalls.types import AudioQuality, MediaStream
+from pytgcalls.types import AudioQuality, MediaStream, VideoQuality
 
 HTML = enums.ParseMode.HTML
 def _cookie_file():
@@ -48,6 +48,8 @@ class Track:
     duration: int
     req_id: int = 0
     req_name: str = "Autoplay"
+    video: bool = False
+    audio_url: str | None = None
 
 
 @dataclass
@@ -55,7 +57,7 @@ class State:
     queue: list = field(default_factory=list)
     current: Track | None = None
     loop: str = "off"  # off | one | all
-    autoplay: bool = False
+    autoplay: bool = True
     volume: int = 100
     paused: bool = False
     pos: float = 0.0  # position at the last anchor
@@ -65,7 +67,12 @@ class State:
     updater: asyncio.Task | None = None
     switching: bool = False
     thumb_on: bool = True
+    gen: int = 0
+    watch: asyncio.Task | None = None
     history: set = field(default_factory=set)
+
+    def raw_position(self) -> float:
+        return self.pos + ((time.monotonic() - self.anchor) if self.anchor else 0)
 
     def position(self) -> float:
         p = self.pos + ((time.monotonic() - self.anchor) if self.anchor else 0)
@@ -99,21 +106,24 @@ def mention(uid: int, name: str) -> str:
     return f'<a href="tg://user?id={uid}">{name}</a>' if uid else name
 
 
-def extract(query: str) -> dict:
-    """YouTube first; if it fails on a text search, fall back to SoundCloud."""
+def extract(query: str, video: bool = False) -> dict:
+    """YouTube first; if it fails on a text search, fall back to SoundCloud (audio only)."""
     try:
-        return _extract(query)
+        return _extract(query, video)
     except Exception as first_error:
-        if query.startswith("http"):
+        if video or query.startswith("http"):
             raise
         try:
-            return _extract(f"scsearch1:{query}")
+            return _extract(f"scsearch1:{query}", False)
         except Exception:
             raise first_error
 
 
-def _extract(query: str) -> dict:
-    with yt_dlp.YoutubeDL(YDL) as y:
+def _extract(query: str, video: bool = False) -> dict:
+    opts = dict(YDL)
+    if video:
+        opts["format"] = "bv*[height<=720]+ba/b[height<=720]/b"
+    with yt_dlp.YoutubeDL(opts) as y:
         info = y.extract_info(query, download=False)
         if "entries" in info:
             entries = [e for e in info["entries"] if e]
@@ -125,23 +135,41 @@ def _extract(query: str) -> dict:
         thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
     else:
         thumb = info.get("thumbnail")
+
+    stream_url, audio_url = info.get("url"), None
+    rf = info.get("requested_formats")
+    if video and rf and len(rf) == 2:  # separate video + audio streams
+        v = next((f for f in rf if f.get("vcodec") not in (None, "none")), rf[0])
+        a_ = next((f for f in rf if f is not v), rf[1])
+        stream_url, audio_url = v["url"], a_["url"]
     return dict(
         title=info.get("title", "Unknown"),
         page_url=info.get("webpage_url") or query,
-        stream_url=info["url"],
+        stream_url=stream_url,
         thumb=thumb,
         duration=int(info.get("duration") or 0),
+        video=video,
+        audio_url=audio_url,
     )
 
 
-def related(title: str, history: set) -> str | None:
-    with yt_dlp.YoutubeDL({**YDL, "extract_flat": True}) as y:
-        res = y.extract_info(f"ytsearch8:{title}", download=False)
-    for e in res.get("entries", []):
+def related(title: str, history: set) -> list[str]:
+    """Up to 4 unplayed candidates similar to `title` (YouTube, then SoundCloud)."""
+    res = None
+    for prefix in ("ytsearch8", "scsearch8"):
+        try:
+            with yt_dlp.YoutubeDL({**YDL, "extract_flat": True}) as y:
+                res = y.extract_info(f"{prefix}:{title}", download=False)
+            if res and res.get("entries"):
+                break
+        except Exception:
+            res = None
+    urls = []
+    for e in (res or {}).get("entries", []):
         url = e.get("url") or e.get("webpage_url")
-        if url and url not in history:
-            return url
-    return None
+        if url and url not in history and url not in urls:
+            urls.append(url)
+    return urls[:4]
 
 
 async def ensure_assistant(chat_id: int):
@@ -233,7 +261,8 @@ async def ensure_assistant(chat_id: int):
 # ───────────────────────── Card ─────────────────────────
 def caption(st: State) -> str:
     t = st.current
-    head = "⏸ <b>PAUSED</b>" if st.paused else "▶️ <b>NOW PLAYING</b>"
+    kind = "VIDEO" if t.video else "AUDIO"
+    head = f"⏸ <b>PAUSED</b> • {kind}" if st.paused else f"▶️ <b>NOW PLAYING</b> • {kind}"
     loop = {"off": "Off", "one": "Track", "all": "Queue"}[st.loop]
     text = (
         f"{head}\n\n"
@@ -338,15 +367,22 @@ async def start_track(chat_id: int, track: Track, offset: float = 0, new_card: b
     st.switching = True
     asyncio.get_running_loop().call_later(2, lambda: setattr(st, "switching", False))
     params = f"-ss {int(offset)}" if offset else None
-    await _call.play(
-        chat_id,
-        MediaStream(
+    if track.video:
+        stream = MediaStream(
+            track.stream_url,
+            audio_parameters=AudioQuality.HIGH,
+            video_parameters=VideoQuality.HD_720p,
+            audio_path=track.audio_url,
+            ffmpeg_parameters=params,
+        )
+    else:
+        stream = MediaStream(
             track.stream_url,
             audio_parameters=AudioQuality.HIGH,
             video_flags=MediaStream.Flags.IGNORE,
             ffmpeg_parameters=params,
-        ),
-    )
+        )
+    await _call.play(chat_id, stream)
     if st.volume != 100:
         try:
             await _call.change_volume_call(chat_id, st.volume)
@@ -357,6 +393,11 @@ async def start_track(chat_id: int, track: Track, offset: float = 0, new_card: b
     st.pos = float(offset)
     st.anchor = time.monotonic()
     st.history.add(track.page_url)
+    st.gen += 1
+    if st.watch:
+        st.watch.cancel()
+    if track.duration:
+        st.watch = asyncio.create_task(_watchdog(chat_id, st.gen))
     if new_card:
         await send_card(chat_id)
     else:
@@ -379,6 +420,8 @@ async def finish(chat_id: int):
         return
     if st.updater:
         st.updater.cancel()
+    if st.watch:
+        st.watch.cancel()
     try:
         await _call.leave_call(chat_id)
     except Exception:
@@ -394,6 +437,31 @@ async def finish(chat_id: int):
             pass
 
 
+async def natural_end(chat_id: int, gen: int):
+    """Called when a track ends by itself. `gen` stops double-advancing."""
+    st = states.get(chat_id)
+    if not st or st.gen != gen or st.switching:
+        return
+    await advance(chat_id, natural=True)
+
+
+async def _watchdog(chat_id: int, gen: int):
+    """Backup for stream_end: moves on when the track's duration has passed."""
+    try:
+        while True:
+            await asyncio.sleep(2)
+            st = states.get(chat_id)
+            if not st or st.gen != gen or not st.current:
+                return
+            if st.paused:
+                continue
+            if st.raw_position() >= st.current.duration + 3:
+                await natural_end(chat_id, gen)
+                return
+    except asyncio.CancelledError:
+        pass
+
+
 async def advance(chat_id: int, natural: bool):
     st = S(chat_id)
     cur = st.current
@@ -404,11 +472,15 @@ async def advance(chat_id: int, natural: bool):
     nxt = st.queue.pop(0) if st.queue else None
     if not nxt and st.autoplay and cur:
         try:
-            url = await asyncio.to_thread(related, cur.title, st.history)
-            if url:
-                nxt = Track(**await asyncio.to_thread(extract, url))
+            urls = await asyncio.to_thread(related, cur.title, st.history)
         except Exception:
-            nxt = None
+            urls = []
+        for url in urls:
+            try:
+                nxt = Track(**await asyncio.to_thread(extract, url, cur.video))
+                break
+            except Exception:
+                continue
     if not nxt:
         return await finish(chat_id)
     await start_track(chat_id, nxt)
@@ -456,19 +528,18 @@ def setup(bot, assistant, call, is_admin, q):
     async def on_stream_end(_, update):
         st = states.get(update.chat_id)
         if st and not st.switching:
-            await advance(update.chat_id, natural=True)
+            await natural_end(update.chat_id, st.gen)
 
     # ── commands ──
-    @bot.on_message(filters.command(["play", "p"]) & filters.group)
-    async def play_cmd(c, m):
+    async def do_play(m, video: bool):
         query = m.text.split(None, 1)[1] if len(m.command) > 1 else None
         if not query and m.reply_to_message and m.reply_to_message.text:
             query = m.reply_to_message.text
         if not query:
-            return await m.reply("Usage: /play <song name or link>")
+            return await m.reply(f"Usage: /{'vplay' if video else 'play'} <song name or link>")
         msg = await m.reply("🔎 Searching…")
         try:
-            info = await asyncio.to_thread(extract, query)
+            info = await asyncio.to_thread(extract, query, video)
             await ensure_assistant(m.chat.id)
             uid, name = who(m)
             pos, tr = await enqueue(m.chat.id, info, uid, name)
@@ -489,10 +560,18 @@ def setup(bot, assistant, call, is_admin, q):
             if "PEER_ID_INVALID" in err:
                 err = ("Telegram couldn't resolve the assistant account. Give the assistant a "
                        "@username (Settings → Username), send one message from it in this group, "
-                       "then try /play again.")
+                       "then try again.")
             if "Sign in" in err or "not a bot" in err:
                 err = "YouTube is blocking this server (cookies needed)."
             await msg.edit(f"❌ Couldn't play: {err[:250]}\nMake sure a voice chat is started in this group.")
+
+    @bot.on_message(filters.command(["play", "p"]) & filters.group)
+    async def play_cmd(c, m):
+        await do_play(m, False)
+
+    @bot.on_message(filters.command(["vplay", "vp"]) & filters.group)
+    async def vplay_cmd(c, m):
+        await do_play(m, True)
 
     @bot.on_message(filters.command("pause") & filters.group)
     async def pause_cmd(c, m):
