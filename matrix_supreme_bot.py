@@ -25,8 +25,8 @@ from datetime import timedelta
 
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
-from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler,
-                          CommandHandler, MessageHandler, filters)
+from telegram.ext import (Application, CallbackQueryHandler, ChatJoinRequestHandler,
+                          ChatMemberHandler, CommandHandler, MessageHandler, filters)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -228,6 +228,32 @@ async def tg_raw(method: str, **params):
     return res["result"]
 
 
+# Optional: resolve ANY @username through a helper user account (Telethon).
+# Set TG_API_ID, TG_API_HASH (from my.telegram.org) and TG_SESSION (a Telethon StringSession).
+_userclient = None
+
+
+async def resolve_username(username: str):
+    global _userclient
+    api_id, api_hash, session = (os.environ.get("TG_API_ID"), os.environ.get("TG_API_HASH"),
+                                 os.environ.get("TG_SESSION"))
+    if not (api_id and api_hash and session):
+        return None
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        if _userclient is None:
+            _userclient = TelegramClient(StringSession(session), int(api_id), api_hash)
+            await _userclient.connect()
+        ent = await _userclient.get_entity(username)
+        if getattr(ent, "bot", False) or not hasattr(ent, "first_name"):
+            return None
+        return ent.id, " ".join(x for x in (ent.first_name, ent.last_name) if x) or username
+    except Exception as e:
+        logging.warning("resolve_username failed: %s", e)
+        return None
+
+
 async def set_member_tag(ctx, chat_id, user_id, tag):
     if hasattr(ctx.bot, "set_chat_member_tag"):
         return await ctx.bot.set_chat_member_tag(chat_id, user_id, tag)
@@ -247,6 +273,8 @@ async def tracker(update: Update, ctx):
     users = list(msg.new_chat_members or [])
     if msg.from_user:
         users.append(msg.from_user)
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        users.append(msg.reply_to_message.from_user)
     for u in users:
         if u.is_bot:
             continue
@@ -273,6 +301,15 @@ async def chat_member_updates(update: Update, ctx):
         return
     q("INSERT OR REPLACE INTO members VALUES(?,?,?,?)", cm.chat.id, u.id,
       (u.username or "").lower(), u.full_name)
+
+
+async def join_request(update: Update, ctx):
+    """Record people who request to join (private/approval groups)."""
+    r = update.chat_join_request
+    if r and not r.from_user.is_bot:
+        u = r.from_user
+        q("INSERT OR REPLACE INTO members VALUES(?,?,?,?)", r.chat.id, u.id,
+          (u.username or "").lower(), u.full_name)
 
 
 async def my_chat_member(update: Update, ctx):
@@ -560,9 +597,13 @@ async def promote(update: Update, ctx):
                         res = await tg_raw("getChat", chat_id=f"@{arg}")
                         target_id = res["id"]
                     except Exception:
-                        return await msg.reply_text(
-                            f"❌ Telegram doesn't let bots look up @{arg} unless the bot has seen them. "
-                            "Reply to any of their messages with /promote, or use /promote <user_id>.")
+                        found = await resolve_username(arg)
+                        if found:
+                            target_id, target_name = found
+                        else:
+                            return await msg.reply_text(
+                                f"❌ Telegram doesn't let bots look up @{arg} unless the bot has seen them. "
+                                "Reply to any of their messages with /promote, or use /promote <user_id>.")
     else:
         return await msg.reply_text("Reply to a user with /promote, or use /promote @username")
 
@@ -1002,6 +1043,7 @@ def main():
     groups = filters.ChatType.GROUPS
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(chat_member_updates, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatJoinRequestHandler(join_request))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye))
     app.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^set:"))
