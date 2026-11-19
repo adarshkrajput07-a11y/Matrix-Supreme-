@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 import yt_dlp
 from pyrogram import enums, filters
-from pyrogram.errors import FloodWait, MessageNotModified, InviteRequestSent, UserAlreadyParticipant, UserNotParticipant
+from pyrogram.errors import FloodWait, MessageNotModified, InviteRequestSent, UserAlreadyParticipant, UserBannedInChannel, UserNotParticipant
 from pyrogram.types import InlineKeyboardButton as B
 from pyrogram.types import InlineKeyboardMarkup as M
 from pytgcalls import filters as fl
@@ -145,22 +145,37 @@ def related(title: str, history: set) -> str | None:
 
 
 async def ensure_assistant(chat_id: int):
-    """Make sure the assistant account is in the group AND knows the chat (fixes PEER_ID_INVALID)."""
+    """Add the assistant to the group if needed and make sure it knows the chat."""
     me = await _assistant.get_me()
     S_ = enums.ChatMemberStatus
-    present = True
+
+    # The bot runs without a saved session, so it has never "met" the assistant account.
+    # Resolving by username fixes PEER_ID_INVALID on the bot side.
+    if me.username:
+        try:
+            await _bot.get_users(me.username)
+        except Exception:
+            pass
+
+    present = None  # None = couldn't tell
     try:
         member = await _bot.get_chat_member(chat_id, me.id)
         if member.status == S_.BANNED:
-            await _bot.unban_chat_member(chat_id, me.id)  # banned/kicked earlier: let it back in
+            try:
+                await _bot.unban_chat_member(chat_id, me.id)
+            except Exception:
+                pass
             present = False
         elif member.status == S_.LEFT or (member.status == S_.RESTRICTED and not member.is_member):
             present = False
+        else:
+            present = True
     except UserNotParticipant:
         present = False
+    except Exception:
+        present = None
 
-    if not present:
-        # The bot adds the assistant itself through an invite link
+    if present is not True:
         try:
             link = await _bot.export_chat_invite_link(chat_id)
         except Exception:
@@ -172,7 +187,9 @@ async def ensure_assistant(chat_id: int):
             await _assistant.join_chat(link)
         except UserAlreadyParticipant:
             pass
-        except InviteRequestSent:  # group uses join approval: approve it automatically
+        except UserBannedInChannel:
+            raise RuntimeError("The assistant account is banned in this group. Unban it and try again.")
+        except InviteRequestSent:  # group uses join approval
             try:
                 await _bot.approve_chat_join_request(chat_id, me.id)
             except Exception:
@@ -190,7 +207,7 @@ async def ensure_assistant(chat_id: int):
 
     if await known():
         return
-    # 1) refresh the assistant's dialog list so it caches the chat
+    # refresh the assistant's chat list so it caches this group
     try:
         async for _ in _assistant.get_dialogs():
             pass
@@ -198,25 +215,19 @@ async def ensure_assistant(chat_id: int):
         pass
     if await known():
         return
-    # 2) public groups: resolve by username
-    chat = await _bot.get_chat(chat_id)
-    if chat.username:
-        try:
-            await _assistant.get_chat(chat.username)
-        except Exception:
-            pass
-        if await known():
-            return
-    # 3) last resort: join through an invite link
+    # public groups: resolve by username
     try:
-        await _assistant.join_chat(await _bot.export_chat_invite_link(chat_id))
-    except UserAlreadyParticipant:
+        chat = await _bot.get_chat(chat_id)
+        if chat.username:
+            await _assistant.get_chat(chat.username)
+    except Exception:
         pass
-    if not await known():
-        raise RuntimeError(
-            "The assistant account can't see this group. Send any message from the assistant "
-            "account in the group once, then try /play again."
-        )
+    if await known():
+        return
+    raise RuntimeError(
+        "The assistant account can't see this group yet. Send any message from the assistant "
+        "account inside the group once, then use /play again."
+    )
 
 
 # ───────────────────────── Card ─────────────────────────
@@ -475,6 +486,10 @@ def setup(bot, assistant, call, is_admin, q):
                     "Start a voice chat in this group, then use /play again.",
                     parse_mode=HTML,
                 )
+            if "PEER_ID_INVALID" in err:
+                err = ("Telegram couldn't resolve the assistant account. Give the assistant a "
+                       "@username (Settings → Username), send one message from it in this group, "
+                       "then try /play again.")
             if "Sign in" in err or "not a bot" in err:
                 err = "YouTube is blocking this server (cookies needed)."
             await msg.edit(f"❌ Couldn't play: {err[:250]}\nMake sure a voice chat is started in this group.")
