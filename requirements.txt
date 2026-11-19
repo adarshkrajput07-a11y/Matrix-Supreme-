@@ -1,5 +1,4 @@
-pyrogram
-tgcrypto
+kurigram
 py-tgcalls
 yt-dlp
 httpx
