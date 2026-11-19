@@ -1,6 +1,8 @@
 """Premium music module: now-playing card, live progress bar, inline controls."""
 import asyncio
+import base64
 import html
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -14,7 +16,24 @@ from pytgcalls import filters as fl
 from pytgcalls.types import AudioQuality, MediaStream
 
 HTML = enums.ParseMode.HTML
+def _cookie_file():
+    """Optional YouTube cookies (Railway variable YT_COOKIES or YT_COOKIES_B64)."""
+    data = None
+    if os.getenv("YT_COOKIES_B64"):
+        data = base64.b64decode(os.environ["YT_COOKIES_B64"]).decode()
+    elif os.getenv("YT_COOKIES"):
+        data = os.environ["YT_COOKIES"]
+    if not data:
+        return None
+    path = "/tmp/yt_cookies.txt"
+    with open(path, "w") as f:
+        f.write(data)
+    return path
+
+
 YDL = {"format": "bestaudio/best", "quiet": True, "noplaylist": True, "default_search": "ytsearch"}
+if _cookie_file():
+    YDL["cookiefile"] = _cookie_file()
 
 _bot = _assistant = _call = _is_admin = _q = None
 
@@ -45,6 +64,7 @@ class State:
     card_photo: bool = False
     updater: asyncio.Task | None = None
     switching: bool = False
+    thumb_on: bool = True
     history: set = field(default_factory=set)
 
     def position(self) -> float:
@@ -80,6 +100,19 @@ def mention(uid: int, name: str) -> str:
 
 
 def extract(query: str) -> dict:
+    """YouTube first; if it fails on a text search, fall back to SoundCloud."""
+    try:
+        return _extract(query)
+    except Exception as first_error:
+        if query.startswith("http"):
+            raise
+        try:
+            return _extract(f"scsearch1:{query}")
+        except Exception:
+            raise first_error
+
+
+def _extract(query: str) -> dict:
     with yt_dlp.YoutubeDL(YDL) as y:
         info = y.extract_info(query, download=False)
         if "entries" in info:
@@ -158,6 +191,8 @@ def keyboard(st: State) -> M:
          B(f"🔊 {st.volume}%", callback_data="mp:vol"),
          B("🔊 Vol +", callback_data="mp:vup")],
     ]
+    rows.append([B(f"🖼 Thumbnail: {'ON' if st.thumb_on else 'OFF'}", callback_data="mp:thumb"),
+                 B("✖ Close", callback_data="mp:close")])
     if st.current.page_url.startswith("http"):
         rows.append([B("🎬 Open Source", url=st.current.page_url)])
     return M(rows)
@@ -205,6 +240,8 @@ async def send_card(chat_id: int):
         except Exception:
             pass
     try:
+        if not st.thumb_on:
+            raise RuntimeError("thumbnail disabled")
         msg = await _bot.send_photo(
             chat_id, st.current.thumb, caption=caption(st), parse_mode=HTML, reply_markup=keyboard(st)
         )
@@ -365,7 +402,16 @@ def setup(bot, assistant, call, is_admin, q):
             else:
                 await msg.delete()
         except Exception as e:
-            await msg.edit(f"❌ Couldn't play: {e}\nMake sure a voice chat is started in this group.")
+            err = str(e)
+            if type(e).__name__ == "NoActiveGroupCall" or "no active" in err.lower():
+                return await msg.edit(
+                    "❌ <b>No active voice chat found.</b>\n"
+                    "Start a voice chat in this group, then use /play again.",
+                    parse_mode=HTML,
+                )
+            if "Sign in" in err or "not a bot" in err:
+                err = "YouTube is blocking this server (cookies needed)."
+            await msg.edit(f"❌ Couldn't play: {err[:250]}\nMake sure a voice chat is started in this group.")
 
     @bot.on_message(filters.command("pause") & filters.group)
     async def pause_cmd(c, m):
@@ -515,6 +561,19 @@ def setup(bot, assistant, call, is_admin, q):
                 st.volume = max(10, min(200, st.volume + (10 if action == "vup" else -10)))
                 await call.change_volume_call(chat_id, st.volume)
                 await refresh_card(chat_id)
+            elif action == "thumb":
+                st.thumb_on = not st.thumb_on
+                await send_card(chat_id)
+                return await cq.answer(f"Thumbnail {'ON' if st.thumb_on else 'OFF'}")
+            elif action == "close":
+                if st.updater:
+                    st.updater.cancel()
+                st.card_id = None
+                try:
+                    await cq.message.delete()
+                except Exception:
+                    pass
+                return await cq.answer("Player closed. Music keeps playing; /np brings it back.")
             elif action == "fav":
                 q(
                     "INSERT OR IGNORE INTO favs(user_id, title, url) VALUES(?, ?, ?)",
