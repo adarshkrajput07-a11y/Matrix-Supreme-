@@ -291,10 +291,21 @@ async def setrules(update: Update, ctx):
     await update.message.reply_text("✅ Rules updated.")
 
 
+HTML_MARK = "<!--html-->"
+
+
+def template_from_message(update: Update) -> str:
+    """Template text from command args, or from the replied-to message (keeps its formatting)."""
+    r = update.message.reply_to_message
+    if r and (r.text or r.caption):
+        return HTML_MARK + (r.text_html if r.text else r.caption_html)
+    return update.message.text.partition(" ")[2].strip()
+
+
 async def setwelcome(update: Update, ctx):
     if not await admin_only(update, ctx):
         return
-    text = update.message.text.partition(" ")[2].strip()
+    text = template_from_message(update)
     if not text:
         return await update.message.reply_text("Usage: /setwelcome Welcome {name} ({username}) to {group}! Read /rules.\n"
             "Placeholders: {name} = member's name, {username} = their @username, {group} = group name")
@@ -305,10 +316,11 @@ async def setwelcome(update: Update, ctx):
 def render(template: str, user, chat) -> str:
     """Fill {name}, {username}, {group} in welcome/goodbye templates."""
     uname = f"@{user.username}" if user.username else html.escape(user.full_name)
-    return (html.escape(template)
-            .replace("{name}", user.mention_html())
-            .replace("{username}", uname)
-            .replace("{group}", html.escape(chat.title or "the group")))
+    body = template[len(HTML_MARK):] if template.startswith(HTML_MARK) else html.escape(template)
+    for key, val in (("name", user.mention_html()), ("username", uname),
+                     ("group", html.escape(chat.title or "the group"))):
+        body = re.sub(r"\{" + key + r"\}", lambda _m, v=val: v, body, flags=re.I)
+    return body
 
 
 async def welcome(update: Update, ctx):
@@ -334,7 +346,7 @@ async def goodbye(update: Update, ctx):
 async def setgoodbye(update: Update, ctx):
     if not await admin_only(update, ctx):
         return
-    text = update.message.text.partition(" ")[2].strip()
+    text = template_from_message(update)
     if not text:
         return await update.message.reply_text("Usage: /setgoodbye Goodbye {name}, we'll miss you in {group}!\n"
             "Placeholders: {name} = member's name, {username} = their @username, {group} = group name")
