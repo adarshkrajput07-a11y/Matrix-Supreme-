@@ -790,7 +790,11 @@ async def adminlist(update: Update, ctx):
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         return await update.message.reply_text("Use this command in a group.")
-    admins = await ctx.bot.get_chat_administrators(chat.id)
+    try:
+        admins = await ctx.bot.get_chat_administrators(chat.id)
+    except Exception as e:
+        logging.exception("adminlist failed")
+        return await update.message.reply_text(f"⚠️ Couldn't fetch the admin list: {type(e).__name__}")
 
     def line(a):
         u = a.user
@@ -812,8 +816,12 @@ async def adminlist(update: Update, ctx):
         parts.append(f"\n⭐ <b>Admins ({len(humans)})</b>\n" + "\n".join(line(a) for a in humans))
     if bots:
         parts.append(f"\n🤖 <b>Bots ({len(bots)})</b>\n" + "\n".join(line(a) for a in bots))
-    await update.message.reply_text("\n".join(parts)[:4000], parse_mode="HTML",
-                                    disable_web_page_preview=True)
+    try:
+        await update.message.reply_text("\n".join(parts)[:4000], parse_mode="HTML")
+    except Exception:
+        logging.exception("adminlist send failed")
+        plain = re.sub(r"<[^>]+>", "", "\n".join(parts))
+        await update.message.reply_text(html.unescape(plain)[:4000])
 
 
 # ---------- federation ban (/fban) ----------
