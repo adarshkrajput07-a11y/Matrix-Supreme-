@@ -10,7 +10,9 @@ Make the bot an ADMIN in your group with: delete messages, ban users, pin messag
 and "manage tags" (for /addtag). In @BotFather: /setprivacy -> Disable.
 """
 import asyncio
+import base64
 import html
+import io
 import json
 import logging
 import os
@@ -23,7 +25,8 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import timedelta
 
-from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters,
+                      Update)
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (Application, CallbackQueryHandler, ChatJoinRequestHandler,
                           ChatMemberHandler, CommandHandler, MessageHandler, filters)
@@ -52,6 +55,12 @@ CREATE TABLE IF NOT EXISTS members(chat_id INTEGER, user_id INTEGER, username TE
     PRIMARY KEY(chat_id, user_id));
 CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, title TEXT);
 CREATE TABLE IF NOT EXISTS fbans(user_id INTEGER PRIMARY KEY, reason TEXT);
+CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+    last_name TEXT);
+CREATE TABLE IF NOT EXISTS filters(chat_id INTEGER, keyword TEXT, kind TEXT, file_id TEXT, body TEXT,
+    PRIMARY KEY(chat_id, keyword));
+CREATE TABLE IF NOT EXISTS quotes(chat_id INTEGER, msg_id INTEGER, file_id TEXT,
+    PRIMARY KEY(chat_id, msg_id));
 """)
 for _col, _ddl in [("welcome_on", "INTEGER DEFAULT 1"), ("goodbye_on", "INTEGER DEFAULT 0"),
                    ("goodbye", "TEXT"), ("clean_service", "INTEGER DEFAULT 0")]:
@@ -88,6 +97,13 @@ HELP = (
     "/lockforward, /unlockforward\n"
     "/links on|off, /flood on|off\n"
     "/addword, /delword, /words\n\n"
+    "Filters (admins):\n"
+    "/filter <word> (reply to a message) — bot answers with that message whenever <word> is said\n"
+    "/filter <word> <reply text>, /filters, /stop <word>, /stopall\n\n"
+    "Quotes (everyone):\n"
+    "/q (reply) — make a quote sticker; replying to that message later shows the quote\n"
+    "/q r — include the replied-to message, /unq (admins) — remove a saved quote\n\n"
+    "Info: /id [reply | @user | id], /info [reply | @user | id]\n\n"
     "Bot owners: /fban (reply or user_id [reason]), /unfban <user_id>"
 )
 
@@ -260,6 +276,12 @@ async def set_member_tag(ctx, chat_id, user_id, tag):
     return await tg_raw("setChatMemberTag", chat_id=chat_id, user_id=user_id, tag=tag)
 
 
+def remember_user(u):
+    if u and not u.is_bot:
+        q("INSERT OR REPLACE INTO users VALUES(?,?,?,?)", u.id, (u.username or "").lower(),
+          u.first_name or "", u.last_name or "")
+
+
 def has_emoji(text: str) -> bool:
     return any(ord(c) > 0xFFFF or unicodedata.category(c) in ("So", "Cs") for c in text)
 
@@ -278,6 +300,7 @@ async def tracker(update: Update, ctx):
     for u in users:
         if u.is_bot:
             continue
+        remember_user(u)
         q("INSERT OR REPLACE INTO members VALUES(?,?,?,?)", chat.id, u.id,
           (u.username or "").lower(), u.full_name)
         if q("SELECT 1 FROM fbans WHERE user_id=?", u.id).fetchone():
@@ -299,6 +322,7 @@ async def chat_member_updates(update: Update, ctx):
         return
     if cm.new_chat_member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
         return
+    remember_user(u)
     q("INSERT OR REPLACE INTO members VALUES(?,?,?,?)", cm.chat.id, u.id,
       (u.username or "").lower(), u.full_name)
 
@@ -308,6 +332,7 @@ async def join_request(update: Update, ctx):
     r = update.chat_join_request
     if r and not r.from_user.is_bot:
         u = r.from_user
+        remember_user(u)
         q("INSERT OR REPLACE INTO members VALUES(?,?,?,?)", r.chat.id, u.id,
           (u.username or "").lower(), u.full_name)
 
@@ -985,6 +1010,309 @@ async def clean_service(update: Update, ctx):
             pass
 
 
+# ---------- /id and /info ----------
+async def lookup_user(update: Update, ctx, arg: str):
+    """Return dict(id, first, last, username) for a @username / numeric id, or None."""
+    arg = arg.strip()
+    if re.fullmatch(r"-?\d{3,}", arg):
+        uid = int(arg)
+        row = q("SELECT username, first_name, last_name FROM users WHERE user_id=?", uid).fetchone()
+        if row:
+            return dict(id=uid, username=row[0], first=row[1], last=row[2])
+        try:
+            c = await ctx.bot.get_chat(uid)
+            return dict(id=uid, username=(c.username or "").lower(), first=c.first_name or "",
+                        last=c.last_name or "")
+        except Exception:
+            row = q("SELECT name FROM members WHERE user_id=? LIMIT 1", uid).fetchone()
+            return dict(id=uid, username="", first=row[0] if row else "", last="")
+    uname = arg.lstrip("@").lower()
+    if not re.fullmatch(r"[a-z0-9_]{3,32}", uname):
+        return None
+    row = q("SELECT user_id, first_name, last_name FROM users WHERE username=?", uname).fetchone()
+    if row:
+        return dict(id=row[0], username=uname, first=row[1], last=row[2])
+    row = q("SELECT user_id, name FROM members WHERE username=? LIMIT 1", uname).fetchone()
+    if row:
+        return dict(id=row[0], username=uname, first=row[1], last="")
+    res = await resolve_username(uname)
+    if res:
+        return dict(id=res[0], username=uname, first=res[1], last="")
+    try:
+        c = await ctx.bot.get_chat("@" + uname)
+        if c.type == "private":
+            return dict(id=c.id, username=uname, first=c.first_name or "", last=c.last_name or "")
+    except Exception:
+        pass
+    return None
+
+
+async def target_user(update: Update, ctx):
+    """Who /id and /info are about: reply > argument > the sender. Returns (info, error)."""
+    msg = update.message
+    r = msg.reply_to_message
+    if r and r.from_user and not ctx.args:
+        u = r.from_user
+        remember_user(u)
+        return dict(id=u.id, username=(u.username or "").lower(), first=u.first_name or "",
+                    last=u.last_name or ""), None
+    if ctx.args:
+        info = await lookup_user(update, ctx, ctx.args[0])
+        if info:
+            return info, None
+        return None, ("I couldn't find that user. I only know people I've seen in a group I'm in — "
+                      "try replying to their message, or use their numeric ID.")
+    u = update.effective_user
+    remember_user(u)
+    return dict(id=u.id, username=(u.username or "").lower(), first=u.first_name or "",
+                last=u.last_name or ""), None
+
+
+def full(info) -> str:
+    return " ".join(x for x in (info["first"], info["last"]) if x) or "User"
+
+
+async def id_cmd(update: Update, ctx):
+    msg, chat = update.message, update.effective_chat
+    has_target = bool(ctx.args or msg.reply_to_message)
+    info, err = await target_user(update, ctx)
+    if err:
+        return await msg.reply_text(err)
+    if has_target:
+        text = f"User <b>{html.escape(full(info))}</b>'s ID is <code>{info['id']}</code>."
+    else:
+        text = f"Your ID is <code>{info['id']}</code>."
+    if chat.type != "private":
+        text += f"\nThis chat's ID is <code>{chat.id}</code>."
+    r = msg.reply_to_message
+    if r and r.forward_origin and getattr(r.forward_origin, "sender_user", None) and not ctx.args:
+        fu = r.forward_origin.sender_user
+        text += f"\nThe forwarded user {html.escape(fu.full_name)}'s ID is <code>{fu.id}</code>."
+    await msg.reply_text(text, parse_mode="HTML")
+
+
+async def info_cmd(update: Update, ctx):
+    msg = update.message
+    info, err = await target_user(update, ctx)
+    if err:
+        return await msg.reply_text(err)
+    lines = ["<b>User info:</b>", f"<b>ID:</b> <code>{info['id']}</code>"]
+    if info["first"]:
+        lines.append(f"<b>First Name:</b> {html.escape(info['first'])}")
+    if info["last"]:
+        lines.append(f"<b>Last Name:</b> {html.escape(info['last'])}")
+    if info["username"]:
+        lines.append(f"<b>Username:</b> @{info['username']}")
+    lines.append(f'<b>User link:</b> <a href="tg://user?id={info["id"]}">link</a>')
+    if update.effective_chat.type != "private":
+        try:
+            st = (await ctx.bot.get_chat_member(update.effective_chat.id, info["id"])).status
+            lines.append(f"<b>Status here:</b> {html.escape(str(st))}")
+        except Exception:
+            pass
+    await msg.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ---------- /filter ----------
+MEDIA_KINDS = ("photo", "video", "animation", "sticker", "document", "audio", "voice", "video_note")
+
+
+def parse_keyword(raw: str):
+    """'"hello there" reply text' -> ('hello there', 'reply text'); 'word rest' -> ('word', 'rest')."""
+    raw = raw.strip()
+    if raw[:1] in "\"'“":
+        close = {'"': '"', "'": "'", "“": "”"}[raw[0]]
+        end = raw.find(close, 1)
+        if end > 0:
+            return raw[1:end].strip().lower(), raw[end + 1:].strip()
+    kw, _, rest = raw.partition(" ")
+    return kw.strip().lower(), rest.strip()
+
+
+def extract_saved(m):
+    """(kind, file_id, body) from a message so it can be replayed later."""
+    if m.text:
+        return "text", None, HTML_MARK + m.text_html
+    body = HTML_MARK + m.caption_html if m.caption else ""
+    for kind in MEDIA_KINDS:
+        obj = getattr(m, kind)
+        if obj:
+            fid = obj[-1].file_id if kind == "photo" else obj.file_id
+            return kind, fid, body
+    return None, None, None
+
+
+async def filter_cmd(update: Update, ctx):
+    if not await admin_only(update, ctx):
+        return
+    msg, cid = update.message, update.effective_chat.id
+    raw = msg.text.partition(" ")[2]
+    if not raw.strip():
+        return await msg.reply_text(
+            "Usage: reply to a message with /filter <word>\n"
+            "or /filter <word> <reply text>\n"
+            'For several words use quotes: /filter "good morning"')
+    kw, rest = parse_keyword(raw)
+    if not kw:
+        return await msg.reply_text("Give me a word to filter.")
+    r = msg.reply_to_message
+    if r:
+        kind, fid, body = extract_saved(r)
+        if not kind:
+            return await msg.reply_text("I can't save that kind of message as a filter.")
+    elif rest:
+        kind, fid, body = "text", None, HTML_MARK + html.escape(rest)
+    else:
+        return await msg.reply_text("Reply to a message, or add the reply text after the word.")
+    q("INSERT OR REPLACE INTO filters VALUES(?,?,?,?,?)", cid, kw, kind, fid, body)
+    rows = q("SELECT keyword FROM filters WHERE chat_id=? ORDER BY keyword", cid).fetchall()
+    await msg.reply_text(f"Saved {len(rows)} filters in {update.effective_chat.title}:\n" +
+                         "\n".join(f"- {r_[0]}" for r_ in rows))
+
+
+async def filters_cmd(update: Update, ctx):
+    rows = q("SELECT keyword FROM filters WHERE chat_id=? ORDER BY keyword",
+             update.effective_chat.id).fetchall()
+    await update.message.reply_text(
+        ("Filters in this chat:\n" + "\n".join(f"- {r[0]}" for r in rows)) if rows
+        else "No filters in this chat yet.")
+
+
+async def stop_cmd(update: Update, ctx):
+    if not await admin_only(update, ctx):
+        return
+    raw = update.message.text.partition(" ")[2]
+    kw, _ = parse_keyword(raw) if raw.strip() else ("", "")
+    if not kw:
+        return await update.message.reply_text("Usage: /stop <word>")
+    cur = q("DELETE FROM filters WHERE chat_id=? AND keyword=?", update.effective_chat.id, kw)
+    await update.message.reply_text("✅ Filter removed." if cur.rowcount else "No such filter.")
+
+
+async def stopall_cmd(update: Update, ctx):
+    if not await admin_only(update, ctx):
+        return
+    q("DELETE FROM filters WHERE chat_id=?", update.effective_chat.id)
+    await update.message.reply_text("✅ All filters removed.")
+
+
+async def filter_trigger(update: Update, ctx):
+    msg = update.message
+    if not msg or not msg.from_user:
+        return
+    text = (msg.text or msg.caption or "").lower()
+    if not text:
+        return
+    cid = msg.chat_id
+    for kw, kind, fid, body in q("SELECT keyword, kind, file_id, body FROM filters WHERE chat_id=?",
+                                 cid).fetchall():
+        if not re.search(r"(?<!\w)" + re.escape(kw) + r"(?!\w)", text):
+            continue
+        caption = render(body, msg.from_user, update.effective_chat) if body else None
+        rp = ReplyParameters(msg.message_id, allow_sending_without_reply=True)
+        try:
+            if kind == "text":
+                await ctx.bot.send_message(cid, caption or "…", parse_mode="HTML", reply_parameters=rp)
+            else:
+                send = getattr(ctx.bot, "send_" + kind)
+                kwargs = {"reply_parameters": rp}
+                if kind not in ("sticker", "video_note"):
+                    kwargs.update(caption=caption, parse_mode="HTML")
+                await send(cid, fid, **kwargs)
+        except Exception as e:
+            logging.warning("filter send failed: %s", e)
+        return  # one filter per message
+
+
+# ---------- /q quotes ----------
+QUOTE_API = os.environ.get("QUOTE_API", "https://bot.lyo.su/quote/generate")
+
+
+def _quote_entities(m):
+    ents = m.entities if m.text else m.caption_entities
+    return [{"type": e.type, "offset": e.offset, "length": e.length} for e in (ents or ())]
+
+
+def _quote_from(m):
+    if m.sender_chat:
+        return {"id": m.sender_chat.id, "name": m.sender_chat.title or "Channel"}
+    u = m.from_user
+    d = {"id": u.id, "name": u.full_name}
+    if u.username:
+        d["username"] = u.username
+    return d
+
+
+async def make_quote_png(target, with_reply: bool):
+    msg = {"entities": _quote_entities(target), "avatar": True, "from": _quote_from(target),
+           "text": target.text or target.caption}
+    rm = target.reply_to_message
+    if with_reply and rm and (rm.text or rm.caption):
+        msg["replyMessage"] = {"name": _quote_from(rm)["name"], "text": rm.text or rm.caption,
+                               "entities": _quote_entities(rm), "chatId": rm.chat_id}
+    payload = json.dumps({"type": "quote", "format": "webp", "backgroundColor": "#1b1429",
+                          "width": 512, "height": 768, "scale": 2, "messages": [msg]}).encode()
+
+    def _call():
+        req = urllib.request.Request(QUOTE_API, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.load(r)
+    res = await asyncio.to_thread(_call)
+    if not res.get("ok"):
+        raise RuntimeError(str(res)[:200])
+    return base64.b64decode(res["result"]["image"])
+
+
+async def quote_cmd(update: Update, ctx):
+    msg = update.message
+    target = msg.reply_to_message
+    if not target:
+        return await msg.reply_text("Reply to a message with /q to quote it. Use /q r to include the message it replied to.")
+    if not (target.text or target.caption):
+        return await msg.reply_text("I can only quote text messages (or captions).")
+    if not (target.from_user or target.sender_chat):
+        return await msg.reply_text("I can't quote that message.")
+    with_reply = bool(ctx.args and ctx.args[0].lower() in ("r", "reply"))
+    try:
+        img = await make_quote_png(target, with_reply)
+    except Exception as e:
+        logging.warning("quote failed: %s", e)
+        return await msg.reply_text("⚠️ Couldn't generate the quote right now, try again in a bit.")
+    f = io.BytesIO(img)
+    f.name = "quote.webp"
+    sent = await ctx.bot.send_sticker(msg.chat_id, f, reply_parameters=ReplyParameters(
+        msg.message_id, allow_sending_without_reply=True))
+    if update.effective_chat.type != "private" and sent.sticker:
+        q("INSERT OR REPLACE INTO quotes VALUES(?,?,?)", msg.chat_id, target.message_id,
+          sent.sticker.file_id)
+
+
+async def unquote_cmd(update: Update, ctx):
+    if not await admin_only(update, ctx):
+        return
+    r = update.message.reply_to_message
+    if not r:
+        return await update.message.reply_text("Reply to the quoted message with /unq.")
+    cur = q("DELETE FROM quotes WHERE chat_id=? AND msg_id=?", update.effective_chat.id, r.message_id)
+    await update.message.reply_text("✅ Quote removed." if cur.rowcount else "That message has no saved quote.")
+
+
+async def quote_trigger(update: Update, ctx):
+    """Someone replied to a message that has a saved quote -> show the quote."""
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+    row = q("SELECT file_id FROM quotes WHERE chat_id=? AND msg_id=?", msg.chat_id,
+            msg.reply_to_message.message_id).fetchone()
+    if row:
+        try:
+            await ctx.bot.send_sticker(msg.chat_id, row[0], reply_parameters=ReplyParameters(
+                msg.message_id, allow_sending_without_reply=True))
+        except Exception as e:
+            logging.warning("quote send failed: %s", e)
+
+
 # ---------- automatic filters ----------
 async def link_filter(update: Update, ctx):
     msg = update.message
@@ -1036,6 +1364,8 @@ def main():
         "tagall": tagall, "lock": lock, "unlock": unlock, "locks": locks_cmd,
         "fban": fban, "unfban": unfban, "kickme": kickme, "addtag": addtag,
         "settings": settings, "welcome": welcome_cmd, "goodbye": goodbye_cmd,
+        "id": id_cmd, "info": info_cmd, "filter": filter_cmd, "filters": filters_cmd,
+        "stop": stop_cmd, "stopall": stopall_cmd, "q": quote_cmd, "unq": unquote_cmd,
         "promote": promote, "setgoodbye": setgoodbye, "lockforward": lockforward, "unlockforward": unlockforward,
     }
     for name, fn in cmds.items():
@@ -1054,6 +1384,9 @@ def main():
                                    text_filter), group=2)
     app.add_handler(MessageHandler(groups & filters.ALL, lock_filter), group=3)
     app.add_handler(MessageHandler(groups & filters.StatusUpdate.ALL, clean_service), group=4)
+    app.add_handler(MessageHandler(groups & ~filters.COMMAND & (filters.TEXT | filters.CAPTION),
+                                   filter_trigger), group=5)
+    app.add_handler(MessageHandler(groups & filters.REPLY & ~filters.COMMAND, quote_trigger), group=6)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
