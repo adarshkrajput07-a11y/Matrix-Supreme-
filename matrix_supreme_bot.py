@@ -84,7 +84,8 @@ HELP = (
     "/kick, /ban, /unban <user_id>\n"
     "/del, /pin, /unpin\n"
     "/tagall [message]\n"
-    "/promote (reply) or /promote @username — make someone an admin\n"
+    "/promote (reply) or /promote @username [tag] — make someone an admin; the optional tag is shown next to their name\n"
+    "/adminlist — show the group's admins\n"
     "/demote (reply / @username / id) — remove their admin rights\n"
     "/demote all — remove every admin the bot is allowed to demote (asks to confirm)\n\n"
     "Locks (admins):\n"
@@ -605,10 +606,13 @@ async def promote(update: Update, ctx):
 
     # find the target: reply, or @username / user_id argument
     target_id, target_name = None, None
+    title = ""  # optional custom admin title (the "tag" shown next to their name)
     r = msg.reply_to_message
     if r and r.from_user and not (r.sender_chat and r.sender_chat.id == chat.id):
         target_id, target_name = r.from_user.id, r.from_user.full_name
+        title = " ".join(ctx.args).strip()          # reply + /promote Captain
     elif ctx.args:
+        title = " ".join(ctx.args[1:]).strip()      # /promote @user Captain
         arg = ctx.args[0].lstrip("@")
         tm = next((e.user for e in (msg.entities or ()) if e.type == "text_mention" and e.user), None)
         if tm:
@@ -638,8 +642,14 @@ async def promote(update: Update, ctx):
                                 f"❌ Telegram doesn't let bots look up @{arg} unless the bot has seen them. "
                                 "Reply to any of their messages with /promote, or use /promote <user_id>.")
     else:
-        return await msg.reply_text("Reply to a user with /promote, or use /promote @username")
+        return await msg.reply_text(
+            "Reply to a user with /promote [tag], or use /promote @username [tag]\n"
+            "The tag is the title shown next to their name, e.g. /promote @user Captain")
 
+    if len(title) > 16:
+        return await msg.reply_text("❌ The tag can be at most 16 characters.")
+    if title and has_emoji(title):
+        return await msg.reply_text("❌ Telegram doesn't allow emoji in admin tags.")
     try:
         member = await ctx.bot.get_chat_member(chat.id, target_id)
     except Exception:
@@ -647,7 +657,14 @@ async def promote(update: Update, ctx):
     if member.status == ChatMemberStatus.OWNER:
         return await msg.reply_text("That's the group owner.")
     if member.status == ChatMemberStatus.ADMINISTRATOR:
-        return await msg.reply_text("They're already an admin.")
+        if not title:
+            return await msg.reply_text("They're already an admin. Add a tag to change it: /promote @user Captain")
+        try:  # already an admin: just update the tag (only works for admins the bot promoted)
+            await ctx.bot.set_chat_administrator_custom_title(chat.id, target_id, title)
+        except Exception:
+            return await msg.reply_text("❌ I can only change the tag of admins that I promoted myself.")
+        return await msg.reply_text(f"🏷 Tag for {html.escape(member.user.full_name)} set to <b>{html.escape(title)}</b>.",
+                                    parse_mode="HTML")
     if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED):
         return await msg.reply_text("❌ That user isn't in the group.")
     if member.user.is_bot:
@@ -664,7 +681,14 @@ async def promote(update: Update, ctx):
         return await msg.reply_text(
             f"❌ Couldn't promote: {e}\nMake sure I'm an admin with the 'Add new admins' permission.")
     _admin_cache.pop((chat.id, target_id), None)
-    await msg.reply_text(f"⭐ {html.escape(target_name)} is now an admin.", parse_mode="HTML")
+    text = f"⭐ {html.escape(target_name)} is now an admin"
+    if title:
+        try:
+            await ctx.bot.set_chat_administrator_custom_title(chat.id, target_id, title)
+            text += f" with the tag <b>{html.escape(title)}</b>"
+        except Exception:
+            text += " (but I couldn't set the tag)"
+    await msg.reply_text(text + ".", parse_mode="HTML")
 
 
 # ---------- /demote ----------
@@ -759,6 +783,37 @@ async def demote_all_cb(update: Update, ctx):
         text += (f"\n\n⚠️ Couldn't demote {len(failed)}:\n" + "\n".join("• " + html.escape(n) for n in failed)
                  + "\n" + CANT_DEMOTE_NOTE)
     await cq.edit_message_text(text, parse_mode="HTML")
+
+
+# ---------- /adminlist ----------
+async def adminlist(update: Update, ctx):
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return await update.message.reply_text("Use this command in a group.")
+    admins = await ctx.bot.get_chat_administrators(chat.id)
+
+    def line(a):
+        u = a.user
+        text = f'<a href="tg://user?id={u.id}">{html.escape(u.full_name)}</a>'
+        if getattr(a, "custom_title", None):
+            text += f" — <i>{html.escape(a.custom_title)}</i>"
+        if getattr(a, "is_anonymous", False):
+            text += " (anonymous)"
+        return "• " + text
+
+    owner = [a for a in admins if a.status == ChatMemberStatus.OWNER]
+    humans = sorted((a for a in admins if a.status == ChatMemberStatus.ADMINISTRATOR and not a.user.is_bot),
+                    key=lambda a: a.user.full_name.lower())
+    bots = [a for a in admins if a.user.is_bot]
+    parts = [f"<b>Admins in {html.escape(chat.title or 'this group')}</b>"]
+    if owner:
+        parts.append("\n👑 <b>Owner</b>\n" + "\n".join(line(a) for a in owner))
+    if humans:
+        parts.append(f"\n⭐ <b>Admins ({len(humans)})</b>\n" + "\n".join(line(a) for a in humans))
+    if bots:
+        parts.append(f"\n🤖 <b>Bots ({len(bots)})</b>\n" + "\n".join(line(a) for a in bots))
+    await update.message.reply_text("\n".join(parts)[:4000], parse_mode="HTML",
+                                    disable_web_page_preview=True)
 
 
 # ---------- federation ban (/fban) ----------
@@ -1776,7 +1831,7 @@ def main():
         "settings": settings, "welcome": welcome_cmd, "goodbye": goodbye_cmd,
         "id": id_cmd, "info": info_cmd, "filter": filter_cmd, "filters": filters_cmd,
         "stop": stop_cmd, "stopall": stopall_cmd, "q": quote_cmd, "unq": unquote_cmd,
-        "promote": promote, "demote": demote, "setgoodbye": setgoodbye, "schedulelockall": schedulelockall, "scheduleunlockall": scheduleunlockall,
+        "promote": promote, "demote": demote, "adminlist": adminlist, "setgoodbye": setgoodbye, "schedulelockall": schedulelockall, "scheduleunlockall": scheduleunlockall,
         "schedules": schedules_cmd, "cancelschedule": cancelschedule, "lockforward": lockforward, "unlockforward": unlockforward,
     }
     for name, fn in cmds.items():
