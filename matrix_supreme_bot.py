@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, username TEXT, fir
     last_name TEXT);
 CREATE TABLE IF NOT EXISTS filters(chat_id INTEGER, keyword TEXT, kind TEXT, file_id TEXT, body TEXT,
     PRIMARY KEY(chat_id, keyword));
+CREATE TABLE IF NOT EXISTS user_quotes(chat_id INTEGER, user_id INTEGER, file_id TEXT,
+    PRIMARY KEY(chat_id, user_id));
 CREATE TABLE IF NOT EXISTS quotes(chat_id INTEGER, msg_id INTEGER, file_id TEXT,
     PRIMARY KEY(chat_id, msg_id));
 """)
@@ -101,7 +103,8 @@ HELP = (
     "/filter <word> <reply text>, /filters, /stop <word>, /stopall\n\n"
     "Quotes (everyone):\n"
     "/q (reply) — make a quote sticker; replying to that message later shows the quote\n"
-    "/q r — include the replied-to message, /unq (admins) — remove a saved quote\n\n"
+    "/q r — include the replied-to message, /q @user — show the quote whenever @user is tagged\n"
+    "/unq (admins, reply) — remove a saved quote\n\n"
     "Info: /id [reply | @user | id], /info [reply | @user | id]\n\n"
     "Bot owners: /fban (reply or user_id [reason]), /unfban <user_id>"
 )
@@ -1379,7 +1382,14 @@ async def quote_cmd(update: Update, ctx):
         return await msg.reply_text("I can only quote text messages (or captions).")
     if not (target.from_user or target.sender_chat):
         return await msg.reply_text("I can't quote that message.")
-    with_reply = bool(ctx.args and ctx.args[0].lower() in ("r", "reply"))
+    with_reply = any(a.lower() in ("r", "reply") for a in ctx.args)
+    tags = [a for a in ctx.args if a.startswith("@")]
+    owner_id = target.from_user.id if target.from_user and not target.sender_chat else None
+    if tags:  # /q @someone -> the quote is shown whenever @someone is tagged
+        info = await lookup_user(update, ctx, tags[0])
+        if not info:
+            return await msg.reply_text("I don't know that @username yet — they must have talked in a group I'm in.")
+        owner_id = info["id"]
     try:
         img = await make_quote_png(target, with_reply, ctx.bot)
     except Exception as e:
@@ -1393,6 +1403,9 @@ async def quote_cmd(update: Update, ctx):
     if update.effective_chat.type != "private" and sent.sticker:
         q("INSERT OR REPLACE INTO quotes VALUES(?,?,?)", msg.chat_id, target.message_id,
           sent.sticker.file_id)
+        if owner_id:
+            q("INSERT OR REPLACE INTO user_quotes VALUES(?,?,?)", msg.chat_id, owner_id,
+              sent.sticker.file_id)
 
 
 async def unquote_cmd(update: Update, ctx):
@@ -1401,8 +1414,12 @@ async def unquote_cmd(update: Update, ctx):
     r = update.message.reply_to_message
     if not r:
         return await update.message.reply_text("Reply to the quoted message with /unq.")
-    cur = q("DELETE FROM quotes WHERE chat_id=? AND msg_id=?", update.effective_chat.id, r.message_id)
-    await update.message.reply_text("✅ Quote removed." if cur.rowcount else "That message has no saved quote.")
+    cid = update.effective_chat.id
+    cur = q("DELETE FROM quotes WHERE chat_id=? AND msg_id=?", cid, r.message_id)
+    n = cur.rowcount
+    if r.from_user:
+        n += q("DELETE FROM user_quotes WHERE chat_id=? AND user_id=?", cid, r.from_user.id).rowcount
+    await update.message.reply_text("✅ Quote removed." if n else "No saved quote for that message or user.")
 
 
 async def quote_trigger(update: Update, ctx):
@@ -1418,6 +1435,39 @@ async def quote_trigger(update: Update, ctx):
                 msg.message_id, allow_sending_without_reply=True))
         except Exception as e:
             logging.warning("quote send failed: %s", e)
+
+
+_mention_cd = {}
+
+
+async def mention_quote_trigger(update: Update, ctx):
+    """Someone @tagged a user who has a saved quote -> show that quote."""
+    msg = update.message
+    if not msg or not msg.from_user:
+        return
+    ids = []
+    for e in msg.entities or ():
+        if e.type == "text_mention" and e.user:
+            ids.append(e.user.id)
+        elif e.type == "mention":
+            uname = msg.text[e.offset + 1:e.offset + e.length].lower()
+            row = q("SELECT user_id FROM users WHERE username=?", uname).fetchone()
+            if row:
+                ids.append(row[0])
+    for uid in dict.fromkeys(ids):
+        row = q("SELECT file_id FROM user_quotes WHERE chat_id=? AND user_id=?", msg.chat_id, uid).fetchone()
+        if not row:
+            continue
+        key = (msg.chat_id, uid)
+        if time.time() - _mention_cd.get(key, 0) < 20:  # anti-spam cooldown
+            continue
+        _mention_cd[key] = time.time()
+        try:
+            await ctx.bot.send_sticker(msg.chat_id, row[0], reply_parameters=ReplyParameters(
+                msg.message_id, allow_sending_without_reply=True))
+        except Exception as e:
+            logging.warning("mention quote failed: %s", e)
+        return
 
 
 # ---------- automatic filters ----------
@@ -1494,6 +1544,9 @@ def main():
     app.add_handler(MessageHandler(groups & ~filters.COMMAND & (filters.TEXT | filters.CAPTION),
                                    filter_trigger), group=5)
     app.add_handler(MessageHandler(groups & filters.REPLY & ~filters.COMMAND, quote_trigger), group=6)
+    app.add_handler(MessageHandler(
+        groups & ~filters.COMMAND & (filters.Entity("mention") | filters.Entity("text_mention")),
+        mention_quote_trigger), group=7)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
