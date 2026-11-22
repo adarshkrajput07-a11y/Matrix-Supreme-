@@ -22,7 +22,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from telegram import (ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters,
                       Update)
@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, username TEXT, fir
     last_name TEXT);
 CREATE TABLE IF NOT EXISTS filters(chat_id INTEGER, keyword TEXT, kind TEXT, file_id TEXT, body TEXT,
     PRIMARY KEY(chat_id, keyword));
+CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER,
+    action TEXT, run_at REAL, daily INTEGER DEFAULT 0, hhmm TEXT);
 CREATE TABLE IF NOT EXISTS user_quotes(chat_id INTEGER, user_id INTEGER, file_id TEXT,
     PRIMARY KEY(chat_id, user_id));
 CREATE TABLE IF NOT EXISTS quotes(chat_id INTEGER, msg_id INTEGER, file_id TEXT,
@@ -87,7 +89,9 @@ HELP = (
     "/lock all — only admins can talk\n"
     "/lock messages stickers gifs photos videos voice audio documents polls forwards "
     "contacts location media links invites\n"
-    "/unlock <same options>, /locks\n\n"
+    "/unlock <same options>, /locks\n"
+    "/schedulelockall <time> [daily] — lock the chat later (10pm, 22:30, 30m, 2h)\n"
+    "/scheduleunlockall <time> [daily], /schedules, /cancelschedule <id|all>\n\n"
     "Tags (admins):\n"
     "/addtag <group_id>\n@username - tag\n@username2 - tag2\n\n"
     "Settings (admins):\n"
@@ -1510,8 +1514,161 @@ async def text_filter(update: Update, ctx):
                 parse_mode="HTML")
 
 
+# ---------- scheduled lock / unlock ----------
+def bot_tz():
+    """Timezone used for clock times (set BOT_TZ, default India)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(os.environ.get("BOT_TZ", "Asia/Kolkata"))
+    except Exception:
+        return timezone(timedelta(hours=5, minutes=30))
+
+
+def next_occurrence(hhmm: str, now):
+    h, m = map(int, hhmm.split(":"))
+    dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    return dt if dt > now else dt + timedelta(days=1)
+
+
+def parse_when(text: str):
+    """'10pm' / '22:30' / '30m' / '1h30m' (+ optional 'daily') -> (run_at_epoch, hhmm_or_None)."""
+    now = datetime.now(bot_tz())
+    t = text.lower().strip()
+    daily = bool(re.search(r"\b(daily|everyday|every day)\b", t))
+    t = re.sub(r"\b(daily|everyday|every day)\b", "", t).strip()
+    if re.fullmatch(r"(?:\d+\s*(?:h|hr|hrs|hours?|m|mins?|minutes?)\s*)+", t):
+        if daily:
+            raise ValueError("'daily' only works with a clock time, e.g. /schedulelockall 11pm daily")
+        mins = sum(int(n) * (60 if u == "h" else 1) for n, u in re.findall(r"(\d+)\s*([hm])", t))
+        if not 1 <= mins <= 7 * 24 * 60:
+            raise ValueError("Pick a time between 1 minute and 7 days from now.")
+        return (now + timedelta(minutes=mins)).timestamp(), None
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?", t)
+    if not m:
+        raise ValueError("Couldn't read that time. Try 10pm, 22:30, 30m or 2h.")
+    h, mi, ap = int(m[1]), int(m[2] or 0), (m[3] or "")[:1]
+    if mi > 59 or (ap and not 1 <= h <= 12) or (not ap and h > 23):
+        raise ValueError("That isn't a valid time. Try 10pm or 22:30.")
+    if ap:
+        h = h % 12 + (12 if ap == "p" else 0)
+    hhmm = f"{h:02d}:{mi:02d}"
+    return next_occurrence(hhmm, now).timestamp(), hhmm
+
+
+def fmt_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts, bot_tz()).strftime("%d %b, %I:%M %p")
+
+
+async def schedule_cmd(update: Update, ctx, action: str):
+    if not await admin_only(update, ctx):
+        return
+    if update.effective_chat.type == "private":
+        return await update.message.reply_text("Use this in a group.")
+    cmd = "schedulelockall" if action == "lock" else "scheduleunlockall"
+    if not ctx.args:
+        return await update.message.reply_text(
+            f"Usage: /{cmd} <time> [daily]\n"
+            f"• /{cmd} 10pm — at 10 PM today (or tomorrow if it has passed)\n"
+            f"• /{cmd} 22:30 daily — every day at 10:30 PM\n"
+            f"• /{cmd} 30m or 2h — after that long\n"
+            "/schedules shows pending ones, /cancelschedule <id|all> removes them.")
+    try:
+        ts, hhmm = parse_when(" ".join(ctx.args))
+    except ValueError as e:
+        return await update.message.reply_text(f"⚠️ {e}")
+    cur = q("INSERT INTO schedules(chat_id, action, run_at, daily, hhmm) VALUES(?,?,?,?,?)",
+            update.effective_chat.id, action, ts, 1 if (hhmm and re.search(r"daily|everyday|every day",
+                                                                         " ".join(ctx.args).lower())) else 0, hhmm)
+    daily = bool(hhmm and re.search(r"daily|everyday|every day", " ".join(ctx.args).lower()))
+    tzname = os.environ.get("BOT_TZ", "Asia/Kolkata")
+    await update.message.reply_text(
+        f"⏰ Chat will be {'🔒 locked' if action == 'lock' else '🔓 unlocked'} at {fmt_ts(ts)} ({tzname})"
+        + (f", and then every day at {hhmm}." if daily else ".") +
+        "\nMake sure I'm an admin with the 'Restrict members' right.")
+
+
+async def schedulelockall(update: Update, ctx):
+    await schedule_cmd(update, ctx, "lock")
+
+
+async def scheduleunlockall(update: Update, ctx):
+    await schedule_cmd(update, ctx, "unlock")
+
+
+async def schedules_cmd(update: Update, ctx):
+    if not await admin_only(update, ctx):
+        return
+    rows = q("SELECT id, action, run_at, daily, hhmm FROM schedules WHERE chat_id=? ORDER BY run_at",
+             update.effective_chat.id).fetchall()
+    if not rows:
+        return await update.message.reply_text("No scheduled locks/unlocks in this chat.")
+    await update.message.reply_text("⏰ Scheduled:\n" + "\n".join(
+        f"#{i} — {'🔒 lock' if a == 'lock' else '🔓 unlock'} at {fmt_ts(t)}" + (" (daily)" if d else "")
+        for i, a, t, d, _ in rows))
+
+
+async def cancelschedule(update: Update, ctx):
+    if not await admin_only(update, ctx):
+        return
+    cid = update.effective_chat.id
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /cancelschedule <id|all>  (see /schedules)")
+    if ctx.args[0].lower() == "all":
+        n = q("DELETE FROM schedules WHERE chat_id=?", cid).rowcount
+    elif ctx.args[0].lstrip("#").isdigit():
+        n = q("DELETE FROM schedules WHERE chat_id=? AND id=?", cid, int(ctx.args[0].lstrip("#"))).rowcount
+    else:
+        return await update.message.reply_text("Give a schedule id or 'all'.")
+    await update.message.reply_text("✅ Removed." if n else "No such schedule.")
+
+
+async def run_schedule(bot, cid: int, action: str):
+    on = action == "lock"
+    try:
+        await bot.set_chat_permissions(cid, NO_PERMS if on else FULL_PERMS,
+                                       use_independent_chat_permissions=True)
+        locks = get_locks(cid)
+        if on:
+            locks.add("all")
+        else:
+            locks.clear()
+        put_locks(cid, locks)
+        await bot.send_message(cid, "🔒 Scheduled lock: only admins can send messages now." if on
+                               else "🔓 Scheduled unlock: everyone can talk again.")
+    except Exception as e:
+        logging.warning("scheduled %s failed in %s: %s", action, cid, e)
+        try:
+            await bot.send_message(cid, f"⚠️ Scheduled {action} failed — am I an admin with the "
+                                        "'Restrict members' right?")
+        except Exception:
+            pass
+
+
+async def scheduler_loop(app):
+    while True:
+        try:
+            now = time.time()
+            for sid, cid, action, run_at, daily, hhmm in q(
+                    "SELECT id, chat_id, action, run_at, daily, hhmm FROM schedules WHERE run_at<=?",
+                    now).fetchall():
+                if daily and hhmm:
+                    q("UPDATE schedules SET run_at=? WHERE id=?",
+                      next_occurrence(hhmm, datetime.now(bot_tz())).timestamp(), sid)
+                else:
+                    q("DELETE FROM schedules WHERE id=?", sid)
+                if now - run_at <= 600:  # skip jobs missed by >10 min (bot was offline)
+                    await run_schedule(app.bot, cid, action)
+        except Exception:
+            logging.exception("scheduler loop error")
+        await asyncio.sleep(15)
+
+
+async def post_init(app):
+    app.bot_data["scheduler"] = asyncio.create_task(scheduler_loop(app))
+
+
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
     cmds = {
         "start": start, "help": start, "rules": rules, "setrules": setrules,
         "setwelcome": setwelcome, "warn": warn, "unwarn": unwarn, "warns": warns,
@@ -1523,7 +1680,8 @@ def main():
         "settings": settings, "welcome": welcome_cmd, "goodbye": goodbye_cmd,
         "id": id_cmd, "info": info_cmd, "filter": filter_cmd, "filters": filters_cmd,
         "stop": stop_cmd, "stopall": stopall_cmd, "q": quote_cmd, "unq": unquote_cmd,
-        "promote": promote, "setgoodbye": setgoodbye, "lockforward": lockforward, "unlockforward": unlockforward,
+        "promote": promote, "setgoodbye": setgoodbye, "schedulelockall": schedulelockall, "scheduleunlockall": scheduleunlockall,
+        "schedules": schedules_cmd, "cancelschedule": cancelschedule, "lockforward": lockforward, "unlockforward": unlockforward,
     }
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, fn))
