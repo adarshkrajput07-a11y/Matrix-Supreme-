@@ -1,6 +1,6 @@
 """
 Matrix Supreme - Telegram Group Moderation Bot
-Requires: pip install "python-telegram-bot>=21"
+Requires: pip install "python-telegram-bot>=21" pillow
 Run:
     BOT_TOKEN=123:ABC OWNER_IDS=111111,222222 python matrix_supreme_bot.py
 Optional: DB_PATH=/data/matrix_supreme.db (use a persistent volume on Railway)
@@ -10,7 +10,6 @@ Make the bot an ADMIN in your group with: delete messages, ban users, pin messag
 and "manage tags" (for /addtag). In @BotFather: /setprivacy -> Disable.
 """
 import asyncio
-import base64
 import html
 import io
 import json
@@ -1225,43 +1224,121 @@ async def filter_trigger(update: Update, ctx):
 
 
 # ---------- /q quotes ----------
-QUOTE_API = os.environ.get("QUOTE_API", "https://bot.lyo.su/quote/generate")
+FONT_DIRS = ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/dejavu", "/usr/share/fonts/TTF",
+             "/usr/share/fonts/truetype/noto", "/usr/share/fonts/truetype/liberation",
+             "/Library/Fonts", "C:/Windows/Fonts"]
+FONT_FILES = {False: ["DejaVuSans.ttf", "NotoSans-Regular.ttf", "LiberationSans-Regular.ttf", "arial.ttf"],
+              True: ["DejaVuSans-Bold.ttf", "NotoSans-Bold.ttf", "LiberationSans-Bold.ttf", "arialbd.ttf"]}
+NAME_COLORS = ["#ff885e", "#ffcd6a", "#82e68b", "#6ae0e8", "#6cb6ff", "#d89bff", "#ff8ec8"]
 
 
-def _quote_entities(m):
-    ents = m.entities if m.text else m.caption_entities
-    return [{"type": e.type, "offset": e.offset, "length": e.length} for e in (ents or ())]
+def _font(size: int, bold: bool = False):
+    from PIL import ImageFont
+    env = os.environ.get("QUOTE_FONT_BOLD" if bold else "QUOTE_FONT")
+    cands = [env] if env else []
+    cands += [os.path.join(d, f) for f in FONT_FILES[bold] for d in FONT_DIRS]
+    for c in cands:
+        if c and os.path.exists(c):
+            try:
+                return ImageFont.truetype(c, size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.load_default(size=size)  # Pillow >= 10.1 built-in scalable font
+    except TypeError:
+        return ImageFont.load_default()
 
 
-def _quote_from(m):
-    if m.sender_chat:
-        return {"id": m.sender_chat.id, "name": m.sender_chat.title or "Channel"}
-    u = m.from_user
-    d = {"id": u.id, "name": u.full_name}
-    if u.username:
-        d["username"] = u.username
-    return d
+def _wrap(draw, text, font, max_w):
+    lines = []
+    for para in text.replace("\r", "").split("\n"):
+        cur = ""
+        for word in para.split(" "):
+            trial = (cur + " " + word).strip() if cur else word
+            if draw.textlength(trial, font=font) <= max_w:
+                cur = trial
+                continue
+            if cur:
+                lines.append(cur)
+            while draw.textlength(word, font=font) > max_w and len(word) > 1:  # very long word
+                k = len(word)
+                while k > 1 and draw.textlength(word[:k], font=font) > max_w:
+                    k -= 1
+                lines.append(word[:k])
+                word = word[k:]
+            cur = word
+        lines.append(cur)
+    return lines
+
+
+def render_quote(name: str, text: str, uid: int = 0, reply_name=None, reply_text=None) -> bytes:
+    """Draw a QuotLy-style quote sticker locally (WEBP, 512 px wide). Needs Pillow."""
+    from PIL import Image, ImageDraw
+    S = 2                                   # supersample for smooth edges
+    W, MAXH = 512 * S, 512 * S
+    pad, av = 16 * S, 56 * S
+    bx0, bx1 = pad + av + 10 * S, W - pad
+    inner = 16 * S
+    tw = bx1 - bx0 - 2 * inner
+    f_txt, f_name, f_small = _font(24 * S), _font(22 * S, True), _font(20 * S)
+    probe = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
+    lh, nh = int(24 * S * 1.3), int(22 * S * 1.35)
+    name = name or "User"
+    color = NAME_COLORS[abs(uid) % len(NAME_COLORS)]
+
+    rq_lines = []
+    if reply_text:
+        rq_lines = _wrap(probe, reply_text, f_small, tw - 14 * S)[:2]
+    rq_h = (int(20 * S * 1.3) * (len(rq_lines) + 1) + 10 * S) if rq_lines else 0
+
+    lines = _wrap(probe, text, f_txt, tw)
+    fixed = 2 * pad + 2 * 12 * S + nh + rq_h
+    max_lines = max(1, (MAXH - fixed) // lh)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip()[:-1] + "…"
+    bh = 12 * S + nh + rq_h + lh * len(lines) + 12 * S
+    H = max(bh, av) + 2 * pad
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((bx0, pad, bx1, pad + bh), radius=18 * S, fill="#1b1429")
+    d.ellipse((pad, pad, pad + av, pad + av), fill=color)
+    initial = name.strip()[:1].upper() or "?"
+    f_init = _font(28 * S, True)
+    d.text((pad + av / 2, pad + av / 2), initial, font=f_init, fill="#1b1429", anchor="mm")
+    y = pad + 12 * S
+    d.text((bx0 + inner, y), name, font=f_name, fill=color)
+    y += nh
+    if rq_lines:
+        d.rounded_rectangle((bx0 + inner, y, bx0 + inner + 3 * S, y + rq_h - 6 * S), radius=2 * S, fill=color)
+        ry = y
+        d.text((bx0 + inner + 12 * S, ry), reply_name or "", font=_font(20 * S, True), fill=color)
+        ry += int(20 * S * 1.3)
+        for ln in rq_lines:
+            d.text((bx0 + inner + 12 * S, ry), ln, font=f_small, fill="#c9c3d6")
+            ry += int(20 * S * 1.3)
+        y += rq_h
+    for ln in lines:
+        d.text((bx0 + inner, y), ln, font=f_txt, fill="#ffffff")
+        y += lh
+    img = img.resize((W // S, H // S), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, "WEBP", quality=95)
+    return out.getvalue()
 
 
 async def make_quote_png(target, with_reply: bool):
-    msg = {"entities": _quote_entities(target), "avatar": True, "from": _quote_from(target),
-           "text": target.text or target.caption}
+    frm = target.sender_chat or target.from_user
+    name = getattr(frm, "title", None) or frm.full_name
     rm = target.reply_to_message
+    rname = rtext = None
     if with_reply and rm and (rm.text or rm.caption):
-        msg["replyMessage"] = {"name": _quote_from(rm)["name"], "text": rm.text or rm.caption,
-                               "entities": _quote_entities(rm), "chatId": rm.chat_id}
-    payload = json.dumps({"type": "quote", "format": "webp", "backgroundColor": "#1b1429",
-                          "width": 512, "height": 768, "scale": 2, "messages": [msg]}).encode()
-
-    def _call():
-        req = urllib.request.Request(QUOTE_API, data=payload,
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            return json.load(r)
-    res = await asyncio.to_thread(_call)
-    if not res.get("ok"):
-        raise RuntimeError(str(res)[:200])
-    return base64.b64decode(res["result"]["image"])
+        rf = rm.sender_chat or rm.from_user
+        rname = getattr(rf, "title", None) or (rf.full_name if rf else "")
+        rtext = rm.text or rm.caption
+    return await asyncio.to_thread(render_quote, name, target.text or target.caption, frm.id,
+                                   rname, rtext)
 
 
 async def quote_cmd(update: Update, ctx):
@@ -1277,8 +1354,9 @@ async def quote_cmd(update: Update, ctx):
     try:
         img = await make_quote_png(target, with_reply)
     except Exception as e:
-        logging.warning("quote failed: %s", e)
-        return await msg.reply_text("⚠️ Couldn't generate the quote right now, try again in a bit.")
+        logging.exception("quote failed")
+        hint = " Install Pillow: pip install pillow" if isinstance(e, ImportError) else ""
+        return await msg.reply_text(f"⚠️ Couldn't generate the quote: {type(e).__name__}.{hint}")
     f = io.BytesIO(img)
     f.name = "quote.webp"
     sent = await ctx.bot.send_sticker(msg.chat_id, f, reply_parameters=ReplyParameters(
