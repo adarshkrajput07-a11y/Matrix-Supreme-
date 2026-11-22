@@ -1271,7 +1271,15 @@ def _wrap(draw, text, font, max_w):
     return lines
 
 
-def render_quote(name: str, text: str, uid: int = 0, reply_name=None, reply_text=None) -> bytes:
+def _clean(t) -> str:
+    """Turn fancy Unicode names (𝐌𝐒 𝐃𝐇𝐎𝐍𝐈, ＭＳ …) into plain letters and drop emoji the font can't draw."""
+    t = unicodedata.normalize("NFKC", t or "")
+    return "".join(c for c in t if unicodedata.category(c) not in ("So", "Cs", "Co", "Cn", "Cf")
+                   and not 0xFE00 <= ord(c) <= 0xFE0F)
+
+
+def render_quote(name: str, text: str, uid: int = 0, reply_name=None, reply_text=None,
+                 avatar=None) -> bytes:
     """Draw a QuotLy-style quote sticker locally (WEBP, 512 px wide). Needs Pillow."""
     from PIL import Image, ImageDraw
     S = 2                                   # supersample for smooth edges
@@ -1283,7 +1291,9 @@ def render_quote(name: str, text: str, uid: int = 0, reply_name=None, reply_text
     f_txt, f_name, f_small = _font(24 * S), _font(22 * S, True), _font(20 * S)
     probe = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
     lh, nh = int(24 * S * 1.3), int(22 * S * 1.35)
-    name = name or "User"
+    name = _clean(name).strip() or "User"
+    text = _clean(text).strip() or "…"
+    reply_name, reply_text = _clean(reply_name), _clean(reply_text).strip()
     color = NAME_COLORS[abs(uid) % len(NAME_COLORS)]
 
     rq_lines = []
@@ -1303,10 +1313,20 @@ def render_quote(name: str, text: str, uid: int = 0, reply_name=None, reply_text
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle((bx0, pad, bx1, pad + bh), radius=18 * S, fill="#1b1429")
-    d.ellipse((pad, pad, pad + av, pad + av), fill=color)
-    initial = name.strip()[:1].upper() or "?"
-    f_init = _font(28 * S, True)
-    d.text((pad + av / 2, pad + av / 2), initial, font=f_init, fill="#1b1429", anchor="mm")
+    photo = None
+    if avatar:
+        try:
+            photo = Image.open(io.BytesIO(avatar)).convert("RGBA").resize((av, av), Image.LANCZOS)
+        except Exception:
+            photo = None
+    if photo:
+        mask = Image.new("L", (av, av), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, av - 1, av - 1), fill=255)
+        img.paste(photo, (pad, pad), mask)
+    else:
+        d.ellipse((pad, pad, pad + av, pad + av), fill=color)
+        d.text((pad + av / 2, pad + av / 2), name[:1].upper(), font=_font(28 * S, True),
+               fill="#1b1429", anchor="mm")
     y = pad + 12 * S
     d.text((bx0 + inner, y), name, font=f_name, fill=color)
     y += nh
@@ -1328,7 +1348,7 @@ def render_quote(name: str, text: str, uid: int = 0, reply_name=None, reply_text
     return out.getvalue()
 
 
-async def make_quote_png(target, with_reply: bool):
+async def make_quote_png(target, with_reply: bool, bot=None):
     frm = target.sender_chat or target.from_user
     name = getattr(frm, "title", None) or frm.full_name
     rm = target.reply_to_message
@@ -1337,8 +1357,17 @@ async def make_quote_png(target, with_reply: bool):
         rf = rm.sender_chat or rm.from_user
         rname = getattr(rf, "title", None) or (rf.full_name if rf else "")
         rtext = rm.text or rm.caption
+    avatar = None
+    if bot and target.from_user and not target.sender_chat:
+        try:  # downloaded by the bot itself; the file URL (with the token) never leaves this server
+            ph = await bot.get_user_profile_photos(target.from_user.id, limit=1)
+            if ph.photos:
+                f = await bot.get_file(ph.photos[0][0].file_id)
+                avatar = bytes(await f.download_as_bytearray())
+        except Exception as e:
+            logging.info("no avatar for quote: %s", e)
     return await asyncio.to_thread(render_quote, name, target.text or target.caption, frm.id,
-                                   rname, rtext)
+                                   rname, rtext, avatar)
 
 
 async def quote_cmd(update: Update, ctx):
@@ -1352,7 +1381,7 @@ async def quote_cmd(update: Update, ctx):
         return await msg.reply_text("I can't quote that message.")
     with_reply = bool(ctx.args and ctx.args[0].lower() in ("r", "reply"))
     try:
-        img = await make_quote_png(target, with_reply)
+        img = await make_quote_png(target, with_reply, ctx.bot)
     except Exception as e:
         logging.exception("quote failed")
         hint = " Install Pillow: pip install pillow" if isinstance(e, ImportError) else ""
