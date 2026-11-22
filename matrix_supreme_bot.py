@@ -84,7 +84,9 @@ HELP = (
     "/kick, /ban, /unban <user_id>\n"
     "/del, /pin, /unpin\n"
     "/tagall [message]\n"
-    "/promote (reply) or /promote @username — make someone an admin\n\n"
+    "/promote (reply) or /promote @username — make someone an admin\n"
+    "/demote (reply / @username / id) — remove their admin rights\n"
+    "/demote all — remove every admin the bot is allowed to demote (asks to confirm)\n\n"
     "Locks (admins):\n"
     "/lock all — only admins can talk\n"
     "/lock messages stickers gifs photos videos voice audio documents polls forwards "
@@ -663,6 +665,100 @@ async def promote(update: Update, ctx):
             f"❌ Couldn't promote: {e}\nMake sure I'm an admin with the 'Add new admins' permission.")
     _admin_cache.pop((chat.id, target_id), None)
     await msg.reply_text(f"⭐ {html.escape(target_name)} is now an admin.", parse_mode="HTML")
+
+
+# ---------- /demote ----------
+NO_ADMIN_RIGHTS = dict(
+    can_manage_chat=False, can_delete_messages=False, can_manage_video_chats=False,
+    can_restrict_members=False, can_promote_members=False, can_change_info=False,
+    can_invite_users=False, can_pin_messages=False)
+CANT_DEMOTE_NOTE = ("Telegram only lets a bot demote admins that it promoted itself. Admins added "
+                    "by the owner or another admin have to be removed by them manually.")
+
+
+async def can_promote_members(ctx, chat_id: int, user_id: int) -> bool:
+    try:
+        c = await ctx.bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return False
+    return c.status == ChatMemberStatus.OWNER or (
+        c.status == ChatMemberStatus.ADMINISTRATOR and getattr(c, "can_promote_members", False))
+
+
+async def demote(update: Update, ctx):
+    msg, chat = update.message, update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return await msg.reply_text("Use this command in a group.")
+    anonymous = msg.sender_chat and msg.sender_chat.id == chat.id
+    if not anonymous and not await can_promote_members(ctx, chat.id, update.effective_user.id):
+        return await msg.reply_text("You need the 'Add new admins' permission to use /demote.")
+
+    if ctx.args and ctx.args[0].lower() == "all":
+        admins = [a for a in await ctx.bot.get_chat_administrators(chat.id)
+                  if a.status == ChatMemberStatus.ADMINISTRATOR and not a.user.is_bot]
+        if not anonymous:
+            admins = [a for a in admins if a.user.id != update.effective_user.id]
+        if not admins:
+            return await msg.reply_text("There are no other admins to demote.")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, demote all", callback_data="demall:yes"),
+                                    InlineKeyboardButton("❌ Cancel", callback_data="demall:no")]])
+        return await msg.reply_text(
+            f"⚠️ Demote {len(admins)} admin(s) in this group? (You and bots are skipped.)", reply_markup=kb)
+
+    # single user: reply, or @username / id
+    r = msg.reply_to_message
+    if r and r.from_user and not ctx.args:
+        uid, name = r.from_user.id, r.from_user.full_name
+    elif ctx.args:
+        info = await lookup_user(update, ctx, ctx.args[0])
+        if not info:
+            return await msg.reply_text("I couldn't find that user. Reply to their message with /demote.")
+        uid, name = info["id"], full(info)
+    else:
+        return await msg.reply_text("Reply to an admin with /demote, use /demote @username, or /demote all.")
+    try:
+        m = await ctx.bot.get_chat_member(chat.id, uid)
+    except Exception:
+        return await msg.reply_text("❌ I couldn't find that user in this group.")
+    if m.status == ChatMemberStatus.OWNER:
+        return await msg.reply_text("That's the group owner.")
+    if m.status != ChatMemberStatus.ADMINISTRATOR:
+        return await msg.reply_text("They aren't an admin.")
+    try:
+        await ctx.bot.promote_chat_member(chat.id, uid, **NO_ADMIN_RIGHTS)
+    except Exception:
+        return await msg.reply_text(f"❌ I couldn't demote them. {CANT_DEMOTE_NOTE}")
+    _admin_cache.pop((chat.id, uid), None)
+    await msg.reply_text(f"⬇️ {html.escape(name)} is no longer an admin.", parse_mode="HTML")
+
+
+async def demote_all_cb(update: Update, ctx):
+    cq = update.callback_query
+    chat = cq.message.chat
+    if not await can_promote_members(ctx, chat.id, cq.from_user.id):
+        return await cq.answer("Only the owner or admins who can add admins can use this.", show_alert=True)
+    if cq.data.endswith(":no"):
+        await cq.answer()
+        return await cq.edit_message_text("Cancelled.")
+    await cq.answer("Working…")
+    await cq.edit_message_text("⏳ Demoting admins…")
+    ok, failed = [], []
+    for a in await ctx.bot.get_chat_administrators(chat.id):
+        u = a.user
+        if a.status != ChatMemberStatus.ADMINISTRATOR or u.is_bot or u.id == cq.from_user.id:
+            continue
+        try:
+            await ctx.bot.promote_chat_member(chat.id, u.id, **NO_ADMIN_RIGHTS)
+            _admin_cache.pop((chat.id, u.id), None)
+            ok.append(u.full_name)
+        except Exception:
+            failed.append(u.full_name)
+        await asyncio.sleep(0.4)  # stay clear of flood limits
+    text = f"⬇️ Demoted {len(ok)} admin(s)" + (":\n" + "\n".join("• " + html.escape(n) for n in ok) if ok else ".")
+    if failed:
+        text += (f"\n\n⚠️ Couldn't demote {len(failed)}:\n" + "\n".join("• " + html.escape(n) for n in failed)
+                 + "\n" + CANT_DEMOTE_NOTE)
+    await cq.edit_message_text(text, parse_mode="HTML")
 
 
 # ---------- federation ban (/fban) ----------
@@ -1680,7 +1776,7 @@ def main():
         "settings": settings, "welcome": welcome_cmd, "goodbye": goodbye_cmd,
         "id": id_cmd, "info": info_cmd, "filter": filter_cmd, "filters": filters_cmd,
         "stop": stop_cmd, "stopall": stopall_cmd, "q": quote_cmd, "unq": unquote_cmd,
-        "promote": promote, "setgoodbye": setgoodbye, "schedulelockall": schedulelockall, "scheduleunlockall": scheduleunlockall,
+        "promote": promote, "demote": demote, "setgoodbye": setgoodbye, "schedulelockall": schedulelockall, "scheduleunlockall": scheduleunlockall,
         "schedules": schedules_cmd, "cancelschedule": cancelschedule, "lockforward": lockforward, "unlockforward": unlockforward,
     }
     for name, fn in cmds.items():
@@ -1692,6 +1788,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye))
     app.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^set:"))
+    app.add_handler(CallbackQueryHandler(demote_all_cb, pattern=r"^demall:"))
     app.add_handler(MessageHandler(groups & filters.ALL, tracker), group=-1)
     app.add_handler(MessageHandler(
         groups & (filters.Entity("url") | filters.Entity("text_link")), link_filter), group=1)
