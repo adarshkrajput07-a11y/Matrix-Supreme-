@@ -1,7 +1,10 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg nodejs gcc && rm -rf /var/lib/apt/lists/*
+    ffmpeg gcc && rm -rf /var/lib/apt/lists/*
+
+# Deno: the JavaScript runtime yt-dlp uses by default for YouTube
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 WORKDIR /app
 COPY requirements.txt .

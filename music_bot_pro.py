@@ -64,8 +64,7 @@ def fmt_views(n):
 
 
 def get_track(query: str, requester: str):
-    opts = {"format": "bestaudio/best", "quiet": True, "noplaylist": True,
-            "js_runtimes": {"node": {}}}   # needs: apt install nodejs
+    opts = {"format": "bestaudio/best", "quiet": True, "noplaylist": True}
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
     if query.startswith("http"):
