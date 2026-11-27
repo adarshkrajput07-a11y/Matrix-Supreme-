@@ -17,6 +17,13 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 SESSION_STRING = os.environ["SESSION_STRING"]
 BOT_NAME = os.getenv("BOT_NAME", "Matrix Supreme")
 
+# Optional: YouTube cookies (Netscape format) in a COOKIES variable
+COOKIES_FILE = None
+if os.getenv("COOKIES"):
+    COOKIES_FILE = "/tmp/cookies.txt"
+    with open(COOKIES_FILE, "w") as f:
+        f.write(os.environ["COOKIES"])
+
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
              in_memory=True)
 assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH,
@@ -59,17 +66,32 @@ def fmt_views(n):
 def get_track(query: str, requester: str):
     opts = {"format": "bestaudio/best", "quiet": True, "noplaylist": True,
             "js_runtimes": {"node": {}}}   # needs: apt install nodejs
-    target = query if query.startswith("http") else f"ytsearch:{query}"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(target, download=False)
-        if "entries" in info:
-            info = info["entries"][0]
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    if query.startswith("http"):
+        targets = [query]
+    else:
+        targets = [f"ytsearch:{query}", f"scsearch:{query}"]
+    info, last_err = None, None
+    for target in targets:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+            if "entries" in info:
+                info = info["entries"][0]
+            break
+        except Exception as e:
+            info, last_err = None, e
+    if info is None:
+        raise last_err
     return {
         "id": info["id"],
         "title": info["title"],
         "url": info["url"],
         "page": info.get("webpage_url"),
-        "thumb": f"https://i.ytimg.com/vi/{info['id']}/hqdefault.jpg",
+        "thumb": (f"https://i.ytimg.com/vi/{info['id']}/hqdefault.jpg"
+                  if str(info.get("extractor_key", "")).lower().startswith("youtube")
+                  else info.get("thumbnail")),
         "duration": info.get("duration"),
         "channel": info.get("uploader", "Unknown"),
         "views": info.get("view_count"),
@@ -222,8 +244,11 @@ async def play(_, m):
     try:
         t = await asyncio.to_thread(get_track, " ".join(m.command[1:]),
                                     m.from_user.mention)
-    except Exception:
-        return await msg.edit("❌ Couldn't find that song.")
+    except Exception as e:
+        return await msg.edit(
+            "❌ <b>Couldn't load that song.</b>\n"
+            f"<blockquote expandable><code>{html.escape(str(e)[:350])}</code></blockquote>",
+            parse_mode=ParseMode.HTML)
     q = queues.setdefault(m.chat.id, [])
     q.append(t)
     await msg.delete()
