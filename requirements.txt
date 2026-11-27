@@ -1,3 +1,4 @@
-python-telegram-bot>=21
-pillow
-tzdata
+pyrofork
+tgcrypto
+py-tgcalls
+yt-dlp[default]
