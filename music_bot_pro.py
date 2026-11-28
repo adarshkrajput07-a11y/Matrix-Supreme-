@@ -85,7 +85,7 @@ def elapsed(t, is_paused):
 def progress_text(t, is_paused, n=10):
     el, dur = elapsed(t, is_paused), t["duration"] or 0
     pos = min(int(n * el / dur), n - 1) if dur else 0
-    return f"{fmt_time(el)} " + "━" * pos + "🟣" + "━" * (n - 1 - pos) + f" {fmt_time(dur)}"
+    return f"{fmt_time(el)} " + "━" * pos + "●" + "━" * (n - 1 - pos) + f" {fmt_time(dur)}"
 
 
 def mark_pause(chat_id, pause: bool):
@@ -241,14 +241,14 @@ def controls(chat_id, t, is_paused=None):
     rows = []
     if is_current(chat_id, t):
         rows.append([B(progress_text(t, is_paused), "noop", "primary")])
-    pr = B("🟣 Resume", "resume", "primary") if is_paused \
-        else B("🟣 Pause", "pause", "primary")
-    rows.append([B("🟣 Replay", "replay", "primary"), pr,
-                 B("🟣 Skip", "skip", "primary")])
+    pr = B("Resume", "resume", "primary") if is_paused \
+        else B("Pause", "pause", "primary")
+    rows.append([B("Replay", "replay", "primary"), pr,
+                 B("Skip", "skip", "primary")])
     n = max(len(queues.get(chat_id, [])) - 1, 0)
-    rows.append([B(f"🟣 Queue · {n}", "queue")])
-    rows.append([B("🟣 Stop", "stop"),
-                 B(f"🟣 Autoplay: {'ON' if is_auto(chat_id) else 'OFF'}", "autoplay")])
+    rows.append([B(f"Queue · {n}", "queue", "primary")])
+    rows.append([B("Stop", "stop", "primary"),
+                 B(f"Autoplay: {'ON' if is_auto(chat_id) else 'OFF'}", "autoplay", "primary")])
     return Markup(rows)
 
 
@@ -294,16 +294,28 @@ async def send_card(chat_id, t, status="💜 Started Streaming On VC."):
     return msg
 
 
+async def leave_vc(chat_id):
+    """Leave the voice chat (retries once and logs failures instead of hiding them)."""
+    for attempt in range(2):
+        try:
+            await call.leave_call(chat_id)
+            return True
+        except Exception as e:
+            msg = str(e).lower()
+            if "not in" in msg or "no active" in msg or "not found" in msg:
+                return True  # already out of the call
+            print(f"[leave_vc] attempt {attempt + 1} failed for {chat_id}: {e!r}")
+            await asyncio.sleep(1)
+    return False
+
+
 # ───────────────────────── streaming ─────────────────────────
 async def start_stream(chat_id):
     q = queues.get(chat_id, [])
     if not q:
         paused.discard(chat_id)
         stop_progress(chat_id)
-        try:
-            await call.leave_call(chat_id)
-        except Exception:
-            pass
+        await leave_vc(chat_id)
         return None
     t = q[0]
     await call.play(chat_id, MediaStream(t["url"],
@@ -473,8 +485,8 @@ async def play(_, m):
             "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
             "👇 <b>Tap the number of the correct song</b>")
     kb = Markup([
-        [B(f"🟣 {i}", f"pick:{i - 1}", "primary") for i in range(1, len(results) + 1)],
-        [B("🟣 Cancel", "pickcancel")],
+        [B(f"{i}", f"pick:{i - 1}", "primary") for i in range(1, len(results) + 1)],
+        [B("Cancel", "pickcancel", "primary")],
     ])
     await msg.edit(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     key = (m.chat.id, msg.id)
