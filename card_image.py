@@ -39,7 +39,7 @@ def make_card_image(art_bytes, title, artist, duration_text):
         art = art.crop((0, 45, 480, 315))
 
     bg = art.resize((W, H)).filter(ImageFilter.GaussianBlur(45)).convert("RGBA")
-    bg = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (0, 0, 0, 130)))
+    bg = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (70, 20, 140, 150)))
 
     side = min(art.size)
     left, top = (art.width - side) // 2, (art.height - side) // 2
@@ -47,6 +47,8 @@ def make_card_image(art_bytes, title, artist, duration_text):
     mask = Image.new("L", (460, 460), 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, 459, 459), 44, fill=255)
     bg.paste(cover, (80, 130), mask)
+    glow = ImageDraw.Draw(bg)
+    glow.rounded_rectangle((78, 128, 542, 592), 46, outline=(196, 150, 255), width=5)
 
     d = ImageDraw.Draw(bg)
     x, right = 600, W - 70
@@ -54,11 +56,11 @@ def make_card_image(art_bytes, title, artist, duration_text):
     d.text((x, 215), _fit(d, title, f_title, right - x), font=f_title,
            fill=(255, 255, 255))
     d.text((x, 295), _fit(d, artist, f_artist, right - x), font=f_artist,
-           fill=(215, 215, 225))
+           fill=(225, 205, 255))
 
     y = 430
-    d.rounded_rectangle((x, y, right, y + 10), 5, fill=(150, 150, 160))
-    d.ellipse((x - 4, y - 9, x + 24, y + 19), fill=(255, 255, 255))
+    d.rounded_rectangle((x, y, right, y + 10), 5, fill=(150, 110, 210))
+    d.ellipse((x - 4, y - 9, x + 24, y + 19), fill=(214, 176, 255))
     d.text((x, y + 32), "00:00", font=f_time, fill=(235, 235, 240))
     d.text((right - d.textlength(duration_text, font=f_time), y + 32),
            duration_text, font=f_time, fill=(235, 235, 240))

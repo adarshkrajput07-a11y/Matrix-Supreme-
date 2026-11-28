@@ -85,7 +85,7 @@ def elapsed(t, is_paused):
 def progress_text(t, is_paused, n=10):
     el, dur = elapsed(t, is_paused), t["duration"] or 0
     pos = min(int(n * el / dur), n - 1) if dur else 0
-    return f"{fmt_time(el)} " + "─" * pos + "●" + "─" * (n - 1 - pos) + f" {fmt_time(dur)}"
+    return f"{fmt_time(el)} " + "━" * pos + "🟣" + "━" * (n - 1 - pos) + f" {fmt_time(dur)}"
 
 
 def mark_pause(chat_id, pause: bool):
@@ -162,6 +162,34 @@ def get_related(last, played):
     return None
 
 
+def search_results(query: str, n: int = 5):
+    """Top search results (title, singer/channel, duration) without resolving audio."""
+    opts = {"quiet": True, "extract_flat": True, "skip_download": True}
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    for prefix in ("ytsearch", "scsearch"):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"{prefix}{n}:{query}", download=False)
+        except Exception:
+            continue
+        out = []
+        for e in info.get("entries") or []:
+            if not e.get("id"):
+                continue
+            url = e.get("url") or e.get("webpage_url") or \
+                f"https://www.youtube.com/watch?v={e['id']}"
+            out.append({
+                "url": url,
+                "title": e.get("title") or "Unknown",
+                "channel": e.get("uploader") or e.get("channel") or "Unknown",
+                "duration": e.get("duration"),
+            })
+        if out:
+            return out
+    return []
+
+
 async def fetch_bytes(url):
     try:
         async with aiohttp.ClientSession() as s:
@@ -188,12 +216,23 @@ def card(t, status):
         title = f'<a href="{t["page"]}">{title}</a>'
     return (
         f"<b>{status}</b>\n\n"
-        f"<blockquote>🎶 <b>Title:</b> {title}\n"
-        f"⏱ <b>Duration:</b> {dur_text(t['duration'])}\n"
-        f"👤 <b>Requested By:</b> {t['by']}</blockquote>\n\n"
+        f"<blockquote>💜 <b>Title:</b> {title}\n"
+        f"🔮 <b>Duration:</b> {dur_text(t['duration'])}\n"
+        f"🟣 <b>Requested By:</b> {t['by']}</blockquote>\n\n"
         f"<blockquote expandable>❝ <i>{random.choice(QUOTES)}</i> ❞</blockquote>\n\n"
-        f"<b>🎶 {BOT_NAME}</b>"
+        f"<b>💜 {BOT_NAME}</b>"
     )
+
+
+def B(text, data, style=None):
+    """Inline button. `style` (primary/success/danger) needs a library that
+    supports Bot API 9.4+; older ones fall back to a plain button."""
+    if style:
+        try:
+            return Btn(text, callback_data=data, style=style)
+        except TypeError:
+            pass
+    return Btn(text, callback_data=data)
 
 
 def controls(chat_id, t, is_paused=None):
@@ -201,16 +240,15 @@ def controls(chat_id, t, is_paused=None):
         is_paused = chat_id in paused
     rows = []
     if is_current(chat_id, t):
-        rows.append([Btn(progress_text(t, is_paused), callback_data="noop")])
-    pr = Btn("▶️ Resume", callback_data="resume") if is_paused \
-        else Btn("⏸ Pause", callback_data="pause")
-    rows.append([Btn("↺ Replay", callback_data="replay"), pr,
-                 Btn("⏭ Skip", callback_data="skip")])
+        rows.append([B(progress_text(t, is_paused), "noop", "primary")])
+    pr = B("🟣 Resume", "resume", "primary") if is_paused \
+        else B("🟣 Pause", "pause", "primary")
+    rows.append([B("🟣 Replay", "replay", "primary"), pr,
+                 B("🟣 Skip", "skip", "primary")])
     n = max(len(queues.get(chat_id, [])) - 1, 0)
-    rows.append([Btn(f"☰ Queue · {n}", callback_data="queue")])
-    rows.append([Btn("⏹ Stop", callback_data="stop"),
-                 Btn(f"🔁 Autoplay: {'ON' if is_auto(chat_id) else 'OFF'}",
-                     callback_data="autoplay")])
+    rows.append([B(f"🟣 Queue · {n}", "queue")])
+    rows.append([B("🟣 Stop", "stop"),
+                 B(f"🟣 Autoplay: {'ON' if is_auto(chat_id) else 'OFF'}", "autoplay")])
     return Markup(rows)
 
 
@@ -238,7 +276,7 @@ async def progress_loop(chat_id, t):
         pass
 
 
-async def send_card(chat_id, t, status="🎵 Started Streaming On VC."):
+async def send_card(chat_id, t, status="💜 Started Streaming On VC."):
     kb, cap = controls(chat_id, t), card(t, status)
     try:
         art = await get_art(t)
@@ -291,7 +329,7 @@ async def do_skip(chat_id):
     q = queues.get(chat_id, [])
     last = q.pop(0) if q else None
     await strip_buttons(chat_id, last)
-    status = "🎵 Started Streaming On VC."
+    status = "💜 Started Streaming On VC."
     if not q and last and is_auto(chat_id):
         vid = await asyncio.to_thread(get_related, last,
                                       set(history.get(chat_id, [])))
@@ -357,17 +395,60 @@ async def ensure_assistant(chat_id, username=None):
 @bot.on_message(filters.command("start"))
 async def start(_, m):
     await m.reply(
-        f"<b>🎶 {BOT_NAME}</b>\n\n"
+        f"<b>💜 {BOT_NAME}</b>\n\n"
         "<blockquote>Add me to a group, start a voice chat and use:\n"
-        "/play &lt;song&gt; • /autoplay • /skip • /pause • /resume • "
+        "/play &lt;song&gt; • /fplay • /autoplay • /skip • /pause • /resume • "
         "/stop • /queue • /tagall</blockquote>",
         parse_mode=ParseMode.HTML)
 
 
-@bot.on_message(filters.command(["play", "p"]) & filters.group)
+pending = {}   # (chat_id, message_id) -> search list waiting for a choice
+
+
+async def add_song(chat_id, target, by, msg):
+    """Load a song (URL or search text), queue it and start playing if idle."""
+    try:
+        t = await asyncio.to_thread(get_track, target, by)
+    except Exception as e:
+        return await msg.edit(
+            "❌ <b>Couldn't load that song.</b>\n"
+            f"<blockquote expandable><code>{html.escape(str(e)[:350])}</code></blockquote>",
+            parse_mode=ParseMode.HTML)
+    q = queues.setdefault(chat_id, [])
+    q.append(t)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    if len(q) == 1:
+        try:
+            await start_stream(chat_id)
+        except Exception as e:
+            q.clear()
+            return await bot.send_message(
+                chat_id, f"❌ Can't join voice chat: <code>{html.escape(str(e))}</code>",
+                parse_mode=ParseMode.HTML)
+        await send_card(chat_id, t)
+    else:
+        await send_card(chat_id, t, f"🟣 Added To Queue (#{len(q) - 1})")
+
+
+async def expire_pending(key, msg, seconds=120):
+    await asyncio.sleep(seconds)
+    if pending.pop(key, None):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+
+@bot.on_message(filters.command(["play", "p", "fplay", "fp"]) & filters.group)
 async def play(_, m):
     if len(m.command) < 2:
         return await m.reply("Usage: /play <song name>")
+    query = " ".join(m.command[1:])
+    by = m.from_user.mention if m.from_user else "Anonymous"
+    force = m.command[0].lower() in ("fplay", "fp") or query.startswith("http")
     msg = await m.reply("🔎 <b>Searching...</b>", parse_mode=ParseMode.HTML)
     ok, err = await ensure_assistant(m.chat.id, m.chat.username)
     if not ok:
@@ -377,27 +458,48 @@ async def play(_, m):
             "assistant account manually.\n\n"
             f"<blockquote expandable><code>{html.escape(err)}</code></blockquote>",
             parse_mode=ParseMode.HTML)
-    try:
-        t = await asyncio.to_thread(get_track, " ".join(m.command[1:]),
-                                    m.from_user.mention)
-    except Exception as e:
-        return await msg.edit(
-            "❌ <b>Couldn't load that song.</b>\n"
-            f"<blockquote expandable><code>{html.escape(str(e)[:350])}</code></blockquote>",
-            parse_mode=ParseMode.HTML)
-    q = queues.setdefault(m.chat.id, [])
-    q.append(t)
-    await msg.delete()
-    if len(q) == 1:
-        try:
-            await start_stream(m.chat.id)
-        except Exception as e:
-            q.clear()
-            return await m.reply(f"❌ Can't join voice chat: <code>{e}</code>",
-                                 parse_mode=ParseMode.HTML)
-        await send_card(m.chat.id, t)
-    else:
-        await send_card(m.chat.id, t, f"➕ Added To Queue (#{len(q) - 1})")
+    if force:   # /fplay or a direct link: play the top result straight away
+        return await add_song(m.chat.id, query, by, msg)
+
+    results = await asyncio.to_thread(search_results, query)
+    if not results:
+        return await msg.edit("❌ No results found. Try a different name.")
+    lines = []
+    for i, r in enumerate(results, 1):
+        dur = fmt_time(r["duration"]) if r["duration"] else "LIVE"
+        lines.append(f"<b>{i}.</b> {html.escape(r['title'][:60])}\n"
+                     f"     👤 {html.escape(r['channel'][:30])}  •  ⏱ {dur}")
+    text = (f"🔎 <b>Results for:</b> <i>{html.escape(query[:50])}</i>\n\n"
+            "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
+            "👇 <b>Tap the number of the correct song</b>")
+    kb = Markup([
+        [B(f"🟣 {i}", f"pick:{i - 1}", "primary") for i in range(1, len(results) + 1)],
+        [B("🟣 Cancel", "pickcancel")],
+    ])
+    await msg.edit(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    key = (m.chat.id, msg.id)
+    pending[key] = {"results": results, "user": m.from_user.id if m.from_user else 0,
+                    "by": by}
+    asyncio.create_task(expire_pending(key, msg))
+
+
+async def handle_pick(cb):
+    key = (cb.message.chat.id, cb.message.id)
+    p = pending.get(key)
+    if not p:
+        return await cb.answer("This list expired. Use /play again.", show_alert=True)
+    if cb.from_user.id != p["user"]:
+        return await cb.answer("Only the person who used /play can choose.",
+                               show_alert=True)
+    pending.pop(key, None)
+    if cb.data == "pickcancel":
+        await cb.answer("Cancelled")
+        return await cb.message.delete()
+    r = p["results"][int(cb.data.split(":")[1])]
+    await cb.answer("▶️ Loading...")
+    await cb.message.edit(f"⏳ <b>Loading:</b> {html.escape(r['title'][:60])}",
+                          parse_mode=ParseMode.HTML)
+    await add_song(cb.message.chat.id, r["url"], p["by"], cb.message)
 
 
 async def queue_text(chat_id):
@@ -560,6 +662,8 @@ async def cancel_tag(_, m):
 @bot.on_callback_query()
 async def buttons(_, cb):
     chat_id, data = cb.message.chat.id, cb.data
+    if data.startswith("pick:") or data == "pickcancel":
+        return await handle_pick(cb)
     q = queues.get(chat_id, [])
     if data == "noop":
         return await cb.answer(
