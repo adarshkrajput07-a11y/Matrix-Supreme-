@@ -2,3 +2,5 @@ pyrofork
 tgcrypto
 py-tgcalls
 yt-dlp[default]
+Pillow
+aiohttp

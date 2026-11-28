@@ -1,15 +1,20 @@
 import asyncio
-import os
 import html
+import os
 import random
+import time
+
+import aiohttp
+import yt_dlp
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
-from pyrogram.errors import UserAlreadyParticipant
+from pyrogram.enums import ChatMemberStatus, ParseMode
+from pyrogram.errors import FloodWait, UserAlreadyParticipant
 from pyrogram.types import (InlineKeyboardButton as Btn,
                             InlineKeyboardMarkup as Markup)
 from pytgcalls import PyTgCalls, idle
 from pytgcalls.types import MediaStream, Update, StreamEnded
-import yt_dlp
+
+from card_image import make_card_image
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -30,14 +35,11 @@ assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH,
                    session_string=SESSION_STRING)
 call = PyTgCalls(assistant)
 
-queues = {}   # chat_id -> [track dicts]
+queues = {}          # chat_id -> [track dicts]; queues[chat][0] is playing
 paused = set()
-autoplay_off = set()   # chats where autoplay is disabled (default: ON)
-history = {}           # chat_id -> recently played video ids
-
-
-def is_auto(chat_id):
-    return chat_id not in autoplay_off
+autoplay_off = set()  # chats with autoplay disabled (default: ON)
+history = {}          # chat_id -> recent video ids
+progress_tasks = {}   # chat_id -> asyncio task
 
 QUOTES = [
     "Where words fail, music speaks.",
@@ -48,21 +50,59 @@ QUOTES = [
 ]
 
 
+# ───────────────────────── helpers ─────────────────────────
+def is_auto(chat_id):
+    return chat_id not in autoplay_off
+
+
 def fmt_time(sec):
     sec = int(sec or 0)
     h, r = divmod(sec, 3600)
     m, s = divmod(r, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-def fmt_views(n):
-    n = int(n or 0)
-    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
-        if n >= div:
-            return f"{n / div:.1f}{unit}"
-    return str(n)
+def dur_text(sec):
+    sec = int(sec or 0)
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
 
 
+def is_current(chat_id, t):
+    q = queues.get(chat_id)
+    return bool(q) and q[0] is t
+
+
+def elapsed(t, is_paused):
+    if not t.get("started"):
+        return 0
+    end = t["paused_at"] if (is_paused and t.get("paused_at")) else time.time()
+    el = end - t["started"] - t.get("paused_total", 0)
+    return max(0, min(el, t["duration"] or el))
+
+
+def progress_text(t, is_paused, n=10):
+    el, dur = elapsed(t, is_paused), t["duration"] or 0
+    pos = min(int(n * el / dur), n - 1) if dur else 0
+    return f"{fmt_time(el)} " + "─" * pos + "●" + "─" * (n - 1 - pos) + f" {fmt_time(dur)}"
+
+
+def mark_pause(chat_id, pause: bool):
+    q = queues.get(chat_id)
+    if not q:
+        return
+    t = q[0]
+    if pause and chat_id not in paused:
+        t["paused_at"] = time.time()
+        paused.add(chat_id)
+    elif not pause and chat_id in paused:
+        t["paused_total"] = t.get("paused_total", 0) + \
+            time.time() - (t.get("paused_at") or time.time())
+        paused.discard(chat_id)
+
+
+# ───────────────────────── YouTube / audio ─────────────────────────
 def get_track(query: str, requester: str):
     opts = {"format": "bestaudio/best", "quiet": True, "noplaylist": True}
     if COOKIES_FILE:
@@ -83,17 +123,21 @@ def get_track(query: str, requester: str):
             info, last_err = None, e
     if info is None:
         raise last_err
+
+    is_yt = str(info.get("extractor_key", "")).lower().startswith("youtube")
+    if is_yt:
+        thumbs = [f"https://i.ytimg.com/vi/{info['id']}/maxresdefault.jpg",
+                  f"https://i.ytimg.com/vi/{info['id']}/hqdefault.jpg"]
+    else:
+        thumbs = [info.get("thumbnail")]
     return {
         "id": info["id"],
         "title": info["title"],
         "url": info["url"],
         "page": info.get("webpage_url"),
-        "thumb": (f"https://i.ytimg.com/vi/{info['id']}/hqdefault.jpg"
-                  if str(info.get("extractor_key", "")).lower().startswith("youtube")
-                  else info.get("thumbnail")),
+        "thumbs": [u for u in thumbs if u],
         "duration": info.get("duration"),
-        "channel": info.get("uploader", "Unknown"),
-        "views": info.get("view_count"),
+        "channel": info.get("uploader") or info.get("channel") or "Unknown",
         "by": requester,
     }
 
@@ -101,6 +145,8 @@ def get_track(query: str, requester: str):
 def get_related(last, played):
     """Pick a related song using YouTube's Mix, falling back to a channel search."""
     opts = {"quiet": True, "extract_flat": True, "playlistend": 20}
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
     vid = last["id"]
     sources = [f"https://www.youtube.com/watch?v={vid}&list=RD{vid}",
                f"ytsearch10:{last['channel']} songs"]
@@ -116,47 +162,106 @@ def get_related(last, played):
     return None
 
 
-def card(t, status="🎧 𝗡𝗼𝘄 𝗣𝗹𝗮𝘆𝗶𝗻𝗴"):
+async def fetch_bytes(url):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status == 200:
+                    return await r.read()
+    except Exception:
+        pass
+    return None
+
+
+async def get_art(t):
+    for url in t["thumbs"]:
+        data = await fetch_bytes(url)
+        if data:
+            return data
+    return None
+
+
+# ───────────────────────── card / buttons ─────────────────────────
+def card(t, status):
+    title = html.escape(t["title"])
+    if t.get("page"):
+        title = f'<a href="{t["page"]}">{title}</a>'
     return (
         f"<b>{status}</b>\n\n"
-        f"<blockquote><b>🎵 {html.escape(t['title'])}</b>\n"
-        f"👤 {html.escape(t['channel'])}\n"
-        f"⏱ {fmt_time(t['duration'])}  •  👁 {fmt_views(t['views'])}</blockquote>\n"
-        f"🙋 <b>Requested by:</b> {t['by']}\n\n"
+        f"<blockquote>🎶 <b>Title:</b> {title}\n"
+        f"⏱ <b>Duration:</b> {dur_text(t['duration'])}\n"
+        f"👤 <b>Requested By:</b> {t['by']}</blockquote>\n\n"
         f"<blockquote expandable>❝ <i>{random.choice(QUOTES)}</i> ❞</blockquote>\n\n"
         f"<b>🎶 {BOT_NAME}</b>"
     )
 
 
-def controls(chat_id, t, is_paused=False):
+def controls(chat_id, t, is_paused=None):
+    if is_paused is None:
+        is_paused = chat_id in paused
+    rows = []
+    if is_current(chat_id, t):
+        rows.append([Btn(progress_text(t, is_paused), callback_data="noop")])
     pr = Btn("▶️ Resume", callback_data="resume") if is_paused \
         else Btn("⏸ Pause", callback_data="pause")
-    rows = [
-        [pr, Btn("⏭ Skip", callback_data="skip"),
-         Btn("⏹ Stop", callback_data="stop")],
-        [Btn("📜 Queue", callback_data="queue"),
-         Btn(f"🔁 Autoplay: {'ON' if is_auto(chat_id) else 'OFF'}",
-             callback_data="autoplay")],
-    ]
-    if t.get("page"):
-        rows[1].append(Btn("🔗 Source", url=t["page"]))
+    rows.append([Btn("↺ Replay", callback_data="replay"), pr,
+                 Btn("⏭ Skip", callback_data="skip")])
+    n = max(len(queues.get(chat_id, [])) - 1, 0)
+    rows.append([Btn(f"☰ Queue · {n}", callback_data="queue")])
+    rows.append([Btn("⏹ Stop", callback_data="stop"),
+                 Btn(f"🔁 Autoplay: {'ON' if is_auto(chat_id) else 'OFF'}",
+                     callback_data="autoplay")])
     return Markup(rows)
 
 
-async def send_card(chat_id, t, status="🎧 𝗡𝗼𝘄 𝗣𝗹𝗮𝘆𝗶𝗻𝗴", reply_to=None):
-    kb = controls(chat_id, t)
+def stop_progress(chat_id):
+    task = progress_tasks.pop(chat_id, None)
+    if task:
+        task.cancel()
+
+
+async def progress_loop(chat_id, t):
+    """Refresh the progress button of the current card every 10 seconds."""
     try:
-        return await bot.send_photo(chat_id, t["thumb"], caption=card(t, status),
-                                    reply_markup=kb, parse_mode=ParseMode.HTML)
+        while is_current(chat_id, t) and t.get("msg_id"):
+            await asyncio.sleep(10)
+            if chat_id in paused or not is_current(chat_id, t):
+                continue
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id, t["msg_id"], controls(chat_id, t))
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        pass
+
+
+async def send_card(chat_id, t, status="🎵 Started Streaming On VC."):
+    kb, cap = controls(chat_id, t), card(t, status)
+    try:
+        art = await get_art(t)
+        img = await asyncio.to_thread(make_card_image, art, t["title"],
+                                      t["channel"], fmt_time(t["duration"]))
+        msg = await bot.send_photo(chat_id, img, caption=cap, reply_markup=kb,
+                                   parse_mode=ParseMode.HTML)
     except Exception:
-        return await bot.send_message(chat_id, card(t, status), reply_markup=kb,
-                                      parse_mode=ParseMode.HTML)
+        msg = await bot.send_message(chat_id, cap, reply_markup=kb,
+                                     parse_mode=ParseMode.HTML)
+    t["msg_id"] = msg.id
+    if is_current(chat_id, t):
+        stop_progress(chat_id)
+        progress_tasks[chat_id] = asyncio.create_task(progress_loop(chat_id, t))
+    return msg
 
 
+# ───────────────────────── streaming ─────────────────────────
 async def start_stream(chat_id):
     q = queues.get(chat_id, [])
     if not q:
         paused.discard(chat_id)
+        stop_progress(chat_id)
         try:
             await call.leave_call(chat_id)
         except Exception:
@@ -166,10 +271,44 @@ async def start_stream(chat_id):
     await call.play(chat_id, MediaStream(t["url"],
                                          video_flags=MediaStream.Flags.IGNORE))
     paused.discard(chat_id)
+    t["started"], t["paused_total"], t["paused_at"] = time.time(), 0, None
     h = history.setdefault(chat_id, [])
-    h.append(t["id"])
+    if not h or h[-1] != t["id"]:
+        h.append(t["id"])
     del h[:-50]
     return t
+
+
+async def strip_buttons(chat_id, t):
+    if t and t.get("msg_id"):
+        try:
+            await bot.edit_message_reply_markup(chat_id, t["msg_id"], None)
+        except Exception:
+            pass
+
+
+async def do_skip(chat_id):
+    q = queues.get(chat_id, [])
+    last = q.pop(0) if q else None
+    await strip_buttons(chat_id, last)
+    status = "🎵 Started Streaming On VC."
+    if not q and last and is_auto(chat_id):
+        vid = await asyncio.to_thread(get_related, last,
+                                      set(history.get(chat_id, [])))
+        if vid:
+            try:
+                t = await asyncio.to_thread(
+                    get_track, f"https://www.youtube.com/watch?v={vid}",
+                    "🤖 Autoplay")
+                q.append(t)
+                status = "🔁 Autoplay"
+            except Exception:
+                pass
+    t = await start_stream(chat_id)
+    if t:
+        await send_card(chat_id, t, status)
+    else:
+        await bot.send_message(chat_id, "✅ Queue finished.")
 
 
 async def ensure_assistant(chat_id, username=None):
@@ -186,8 +325,6 @@ async def ensure_assistant(chat_id, username=None):
 
     if await known():
         return True, ""
-
-    # public group: join by username
     if username:
         try:
             await assistant.join_chat(username)
@@ -197,8 +334,6 @@ async def ensure_assistant(chat_id, username=None):
             errs.append(f"join @{username}: {e}")
         if await known():
             return True, ""
-
-    # private group: bot makes an invite link, assistant joins with it
     try:
         link = await bot.export_chat_invite_link(chat_id)
     except Exception as e:
@@ -208,7 +343,7 @@ async def ensure_assistant(chat_id, username=None):
         await assistant.join_chat(link)
     except UserAlreadyParticipant:
         try:
-            await assistant.get_chat(link)   # caches the group for the assistant
+            await assistant.get_chat(link)
         except Exception as e:
             errs.append(f"resolve: {e}")
     except Exception as e:
@@ -218,12 +353,14 @@ async def ensure_assistant(chat_id, username=None):
     return False, "\n".join(errs[-3:])
 
 
+# ───────────────────────── commands ─────────────────────────
 @bot.on_message(filters.command("start"))
 async def start(_, m):
     await m.reply(
         f"<b>🎶 {BOT_NAME}</b>\n\n"
         "<blockquote>Add me to a group, start a voice chat and use:\n"
-        "/play &lt;song&gt; • /autoplay • /skip • /pause • /resume • /stop • /queue</blockquote>",
+        "/play &lt;song&gt; • /autoplay • /skip • /pause • /resume • "
+        "/stop • /queue • /tagall</blockquote>",
         parse_mode=ParseMode.HTML)
 
 
@@ -260,7 +397,7 @@ async def play(_, m):
                                  parse_mode=ParseMode.HTML)
         await send_card(m.chat.id, t)
     else:
-        await send_card(m.chat.id, t, f"➕ 𝗤𝘂𝗲𝘂𝗲𝗱 #{len(q) - 1}")
+        await send_card(m.chat.id, t, f"➕ Added To Queue (#{len(q) - 1})")
 
 
 async def queue_text(chat_id):
@@ -296,83 +433,171 @@ async def skip_cmd(_, m):
     await do_skip(m.chat.id)
 
 
+async def do_stop(chat_id):
+    q = queues.get(chat_id, [])
+    if q:
+        await strip_buttons(chat_id, q[0])
+    queues[chat_id] = []
+    await start_stream(chat_id)
+
+
 @bot.on_message(filters.command("stop") & filters.group)
 async def stop_cmd(_, m):
-    queues[m.chat.id] = []
-    await start_stream(m.chat.id)
+    await do_stop(m.chat.id)
     await m.reply("⏹ <b>Stopped.</b>", parse_mode=ParseMode.HTML)
 
 
 @bot.on_message(filters.command("pause") & filters.group)
 async def pause_cmd(_, m):
     await call.pause(m.chat.id)
-    paused.add(m.chat.id)
+    mark_pause(m.chat.id, True)
     await m.reply("⏸ <b>Paused.</b>", parse_mode=ParseMode.HTML)
 
 
 @bot.on_message(filters.command("resume") & filters.group)
 async def resume_cmd(_, m):
     await call.resume(m.chat.id)
-    paused.discard(m.chat.id)
+    mark_pause(m.chat.id, False)
     await m.reply("▶️ <b>Resumed.</b>", parse_mode=ParseMode.HTML)
 
 
-async def do_skip(chat_id):
-    q = queues.get(chat_id, [])
-    last = q.pop(0) if q else None
-    status = "🎧 𝗡𝗼𝘄 𝗣𝗹𝗮𝘆𝗶𝗻𝗴"
-    if not q and last and is_auto(chat_id):
-        vid = await asyncio.to_thread(get_related, last,
-                                      set(history.get(chat_id, [])))
-        if vid:
+# ───────────────────────── /tagall ─────────────────────────
+tag_running = set()
+
+
+async def is_admin(m):
+    if not m.from_user:   # anonymous admin posting as the group
+        return bool(m.sender_chat and m.sender_chat.id == m.chat.id)
+    try:
+        mem = await bot.get_chat_member(m.chat.id, m.from_user.id)
+        return mem.status in (ChatMemberStatus.OWNER,
+                              ChatMemberStatus.ADMINISTRATOR)
+    except Exception:
+        return False
+
+
+async def collect_members(client, chat_id):
+    users = []
+    async for mem in client.get_chat_members(chat_id):
+        u = mem.user
+        if u and not u.is_bot and not u.is_deleted:
+            users.append(u)
+    return users
+
+
+@bot.on_message(filters.command(["tagall", "all"]) & filters.group)
+async def tagall(_, m):
+    cid = m.chat.id
+    if not await is_admin(m):
+        return await m.reply("❌ Only group admins can use /tagall.")
+    if cid in tag_running:
+        return await m.reply("Already tagging. Send /cancel to stop.")
+    text = html.escape(" ".join(m.command[1:])) or "📢 <b>Attention everyone!</b>"
+    note = await m.reply("👥 <b>Collecting members...</b>",
+                         parse_mode=ParseMode.HTML)
+
+    # The bot can only mention people it has "seen". It lists members first;
+    # if it sees too few (large groups), the assistant account lists and tags.
+    sender, users, total = bot, [], 0
+    try:
+        users = await collect_members(bot, cid)
+        total = await bot.get_chat_members_count(cid)
+    except Exception:
+        pass
+    if not users or len(users) < total * 0.7:
+        ok, err = await ensure_assistant(cid, m.chat.username)
+        if ok:
             try:
-                t = await asyncio.to_thread(
-                    get_track, f"https://www.youtube.com/watch?v={vid}",
-                    "🤖 Autoplay")
-                q.append(t)
-                status = "🔁 𝗔𝘂𝘁𝗼𝗽𝗹𝗮𝘆"
+                alt = await collect_members(assistant, cid)
+                if len(alt) > len(users):
+                    users, sender = alt, assistant
             except Exception:
                 pass
-    t = await start_stream(chat_id)
-    if t:
-        await send_card(chat_id, t, status)
-    else:
-        await bot.send_message(chat_id, "✅ Queue finished.")
+    if not users:
+        return await note.edit("❌ Couldn't get the member list.")
+
+    await note.edit(f"📢 <b>Tagging {len(users)} members...</b>\n"
+                    "Send /cancel to stop.", parse_mode=ParseMode.HTML)
+    tag_running.add(cid)
+    sent, completed = 0, False
+    try:
+        for i in range(0, len(users), 5):
+            if cid not in tag_running:
+                break
+            chunk = users[i:i + 5]
+            names = " ".join(
+                f'<a href="tg://user?id={u.id}">'
+                f'{html.escape((u.first_name or "User")[:12])}</a>'
+                for u in chunk)
+            for _attempt in range(2):
+                try:
+                    await sender.send_message(
+                        cid, f"{text}\n\n{names}", parse_mode=ParseMode.HTML)
+                    sent += len(chunk)
+                    break
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 1)
+                except Exception:
+                    break
+            await asyncio.sleep(3)
+        else:
+            completed = True
+    finally:
+        tag_running.discard(cid)
+    await bot.send_message(
+        cid, f"✅ <b>Tagged {sent} members.</b>" if completed
+        else f"⏹ <b>Tagging stopped after {sent} members.</b>",
+        parse_mode=ParseMode.HTML)
 
 
+@bot.on_message(filters.command("cancel") & filters.group)
+async def cancel_tag(_, m):
+    if await is_admin(m):
+        tag_running.discard(m.chat.id)
+
+
+# ───────────────────────── buttons ─────────────────────────
 @bot.on_callback_query()
 async def buttons(_, cb):
     chat_id, data = cb.message.chat.id, cb.data
     q = queues.get(chat_id, [])
+    if data == "noop":
+        return await cb.answer(
+            progress_text(q[0], chat_id in paused) if q else "Nothing playing")
     if data == "pause":
         await call.pause(chat_id)
-        paused.add(chat_id)
+        mark_pause(chat_id, True)
     elif data == "resume":
         await call.resume(chat_id)
-        paused.discard(chat_id)
+        mark_pause(chat_id, False)
+    elif data == "replay":
+        if not q:
+            return await cb.answer("Nothing playing", show_alert=True)
+        await start_stream(chat_id)
+        await cb.answer("↺ Replaying")
     elif data == "skip":
         await cb.answer("⏭ Skipped")
         return await do_skip(chat_id)
     elif data == "stop":
-        queues[chat_id] = []
-        await start_stream(chat_id)
         await cb.answer("⏹ Stopped")
-        return await cb.message.edit_reply_markup(None)
+        return await do_stop(chat_id)
     elif data == "autoplay":
         autoplay_off.symmetric_difference_update({chat_id})
         await cb.answer("Autoplay " + ("ON" if is_auto(chat_id) else "OFF"))
-        if q:
-            await cb.message.edit_reply_markup(
-                controls(chat_id, q[0], chat_id in paused))
-        return
     elif data == "queue":
         return await cb.answer(
             "\n".join(f"{i}. {t['title'][:40]}" for i, t in enumerate(q[:6]))
             or "Queue is empty", show_alert=True)
-    if q:
-        await cb.message.edit_reply_markup(
-            controls(chat_id, q[0], chat_id in paused))
-    await cb.answer()
+    # refresh the buttons of the card that was tapped
+    if q and cb.message.id == q[0].get("msg_id"):
+        try:
+            await cb.message.edit_reply_markup(controls(chat_id, q[0]))
+        except Exception:
+            pass
+    try:
+        await cb.answer()
+    except Exception:
+        pass
 
 
 @call.on_update()
